@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(py -3.12 -c \"import onnx; print\\(onnx.__version__\\)\")",
+      "Bash(py -3.12 -c ' *)",
+      "Bash(cp \"C:/Users/Kimo_/OneDrive - Alexandria University/Desktop/pyramidstech/Binary_ONNX_to_RTL/build_binaryclass_calib.py\" \"c:/Users/Kimo_/OneDrive - Alexandria University/Desktop/Multiclass/multiclass_calib.py\")",
+      "Bash(cp \"C:/Users/Kimo_/OneDrive - Alexandria University/Desktop/pyramidstech/Binary_ONNX_to_RTL/onnx_quantize.py\" \"c:/Users/Kimo_/OneDrive - Alexandria University/Desktop/Multiclass/multiclass_quantize.py\")",
+      "Bash(py -3.12 -c \"import sys; sys.path.insert\\(0, r'c:/Users/Kimo_/OneDrive - Alexandria University/Desktop/Multiclass'\\); import multiclass_rtl_mapper; print\\('OK', dir\\(multiclass_rtl_mapper\\)[:10]\\)\")"
+    ]
+  }
+}

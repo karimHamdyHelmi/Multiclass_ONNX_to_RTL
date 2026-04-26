@@ -1,0 +1,313 @@
+{
+  "model": "Multiclass_Conv",
+  "head": "softmax",
+  "num_classes": 10,
+  "conv_layers": [
+    {
+      "name": "conv2d_proj_conv",
+      "op_kind": "depthwise",
+      "in_channels": 1,
+      "out_channels": 2,
+      "kernel": [
+        3,
+        3
+      ],
+      "stride": [
+        1,
+        1
+      ],
+      "pad": [
+        0,
+        0
+      ],
+      "in_h": 720,
+      "in_w": 3,
+      "out_h": 718,
+      "out_w": 1,
+      "activation": null,
+      "fin_qdq": 7,
+      "fw_frac": 6,
+      "fb_rtl": 13,
+      "fout_qdq": 5,
+      "layer_scale": 8
+    },
+    {
+      "name": "conv2d_proj_out",
+      "op_kind": "pointwise",
+      "in_channels": 2,
+      "out_channels": 32,
+      "kernel": [
+        1,
+        1
+      ],
+      "stride": [
+        1,
+        1
+      ],
+      "pad": [
+        0,
+        0
+      ],
+      "in_h": 718,
+      "in_w": 1,
+      "out_h": 718,
+      "out_w": 1,
+      "activation": null,
+      "fin_qdq": 5,
+      "fw_frac": 7,
+      "fb_rtl": 12,
+      "fout_qdq": 7,
+      "layer_scale": 5
+    },
+    {
+      "name": "conv2d_1_proj_in",
+      "op_kind": "pointwise",
+      "in_channels": 32,
+      "out_channels": 2,
+      "kernel": [
+        1,
+        1
+      ],
+      "stride": [
+        1,
+        1
+      ],
+      "pad": [
+        0,
+        0
+      ],
+      "in_h": 718,
+      "in_w": 1,
+      "out_h": 718,
+      "out_w": 1,
+      "activation": null,
+      "fin_qdq": 7,
+      "fw_frac": 7,
+      "fb_rtl": 14,
+      "fout_qdq": 4,
+      "layer_scale": 10
+    },
+    {
+      "name": "conv2d_1_proj_conv",
+      "op_kind": "depthwise",
+      "in_channels": 2,
+      "out_channels": 2,
+      "kernel": [
+        3,
+        1
+      ],
+      "stride": [
+        1,
+        1
+      ],
+      "pad": [
+        0,
+        0
+      ],
+      "in_h": 718,
+      "in_w": 1,
+      "out_h": 716,
+      "out_w": 1,
+      "activation": null,
+      "fin_qdq": 4,
+      "fw_frac": 7,
+      "fb_rtl": 11,
+      "fout_qdq": 2,
+      "layer_scale": 9
+    },
+    {
+      "name": "conv2d_1_proj_out",
+      "op_kind": "pointwise",
+      "in_channels": 2,
+      "out_channels": 16,
+      "kernel": [
+        1,
+        1
+      ],
+      "stride": [
+        1,
+        1
+      ],
+      "pad": [
+        0,
+        0
+      ],
+      "in_h": 716,
+      "in_w": 1,
+      "out_h": 716,
+      "out_w": 1,
+      "activation": null,
+      "fin_qdq": 2,
+      "fw_frac": 7,
+      "fb_rtl": 9,
+      "fout_qdq": 3,
+      "layer_scale": 6
+    },
+    {
+      "name": "conv2d_2_proj_in",
+      "op_kind": "pointwise",
+      "in_channels": 16,
+      "out_channels": 2,
+      "kernel": [
+        1,
+        1
+      ],
+      "stride": [
+        1,
+        1
+      ],
+      "pad": [
+        0,
+        0
+      ],
+      "in_h": 716,
+      "in_w": 1,
+      "out_h": 716,
+      "out_w": 1,
+      "activation": null,
+      "fin_qdq": 3,
+      "fw_frac": 7,
+      "fb_rtl": 10,
+      "fout_qdq": 2,
+      "layer_scale": 8
+    },
+    {
+      "name": "conv2d_2_proj_conv",
+      "op_kind": "depthwise",
+      "in_channels": 2,
+      "out_channels": 2,
+      "kernel": [
+        3,
+        1
+      ],
+      "stride": [
+        1,
+        1
+      ],
+      "pad": [
+        0,
+        0
+      ],
+      "in_h": 716,
+      "in_w": 1,
+      "out_h": 714,
+      "out_w": 1,
+      "activation": null,
+      "fin_qdq": 2,
+      "fw_frac": 7,
+      "fb_rtl": 9,
+      "fout_qdq": 0,
+      "layer_scale": 9
+    },
+    {
+      "name": "conv2d_2_proj_out",
+      "op_kind": "pointwise",
+      "in_channels": 2,
+      "out_channels": 8,
+      "kernel": [
+        1,
+        1
+      ],
+      "stride": [
+        1,
+        1
+      ],
+      "pad": [
+        0,
+        0
+      ],
+      "in_h": 714,
+      "in_w": 1,
+      "out_h": 714,
+      "out_w": 1,
+      "activation": null,
+      "fin_qdq": 0,
+      "fw_frac": 7,
+      "fb_rtl": 7,
+      "fout_qdq": 1,
+      "layer_scale": 6
+    }
+  ],
+  "fc_layers": [
+    {
+      "name": "fc1",
+      "in_features": 1432,
+      "out_features": 4,
+      "activation": null,
+      "fin_qdq": 1,
+      "fw_frac": 7,
+      "fb_rtl": 8,
+      "fout_qdq": 0
+    },
+    {
+      "name": "fc2",
+      "in_features": 4,
+      "out_features": 50,
+      "activation": null,
+      "fin_qdq": 0,
+      "fw_frac": 7,
+      "fb_rtl": 7,
+      "fout_qdq": 0
+    },
+    {
+      "name": "fc3",
+      "in_features": 50,
+      "out_features": 4,
+      "activation": null,
+      "fin_qdq": 0,
+      "fw_frac": 7,
+      "fb_rtl": 7,
+      "fout_qdq": 0
+    },
+    {
+      "name": "fc4",
+      "in_features": 4,
+      "out_features": 50,
+      "activation": null,
+      "fin_qdq": 0,
+      "fw_frac": 7,
+      "fb_rtl": 7,
+      "fout_qdq": 0
+    },
+    {
+      "name": "fc5",
+      "in_features": 50,
+      "out_features": 3,
+      "activation": null,
+      "fin_qdq": 0,
+      "fw_frac": 7,
+      "fb_rtl": 7,
+      "fout_qdq": 0
+    },
+    {
+      "name": "fc6",
+      "in_features": 3,
+      "out_features": 25,
+      "activation": null,
+      "fin_qdq": 0,
+      "fw_frac": 7,
+      "fb_rtl": 7,
+      "fout_qdq": 0
+    },
+    {
+      "name": "fc7",
+      "in_features": 25,
+      "out_features": 3,
+      "activation": null,
+      "fin_qdq": 0,
+      "fw_frac": 7,
+      "fb_rtl": 7,
+      "fout_qdq": 0
+    },
+    {
+      "name": "fc8",
+      "in_features": 3,
+      "out_features": 10,
+      "activation": null,
+      "fin_qdq": 0,
+      "fw_frac": 7,
+      "fb_rtl": 6,
+      "fout_qdq": 0
+    }
+  ]
+}

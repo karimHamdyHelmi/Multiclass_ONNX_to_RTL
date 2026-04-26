@@ -1,495 +1,742 @@
 #!/usr/bin/env python3
 """
-Convert multiclass ONNX models (fully connected layers) to RTL and .mem files.
-Supports 3+ output classes (e.g. MNIST 10, CIFAR-100). Uses detect_quant_type.py
-for autodetection of quantization (int4, int8, int16).
-"""
+Multiclass ONNX to RTL Converter
+================================
+End-to-end pipeline: takes a **float32** ONNX classifier with Conv + FC layers and
+produces synthesizable SystemVerilog RTL plus ``.mem`` weight/bias ROM files.
 
+Supported operators:
+  Conv (depthwise & pointwise), Gemm, MatMul (with optional Add bias),
+  Relu, AveragePool, Transpose, Reshape, Softmax, ArgMax.
+
+Pipeline (three stages, all automated from ``--model``):
+  1. **Calibrate** — build a synthetic calibration ``.npz`` from the float model's
+     input shapes (deterministic + normal + uniform random batches). This feeds
+     ORT's activation range observer so it can choose per-tensor int8 scales.
+  2. **Quantize** — run ``onnxruntime.quantization.quantize_static`` in QDQ int8
+     mode, producing a *temporary* quantized ONNX with Q/DQ nodes around every
+     conv/FC weight and activation.
+  3. **Generate RTL** — extract Conv + FC layers from the quantized ONNX (using
+     the float weights as the ground truth source for Fw computation), build
+     RTL fixed-point descriptors (Fin/Fw/Fb/Fout power-of-two), validate
+     numeric fidelity, and emit:
+       - quant_pkg.sv, mac.sv, fc_in/out.sv, relu_layer.sv, sync_fifo.sv
+       - line_buffers.sv, depthwise_conv_engine.sv, pointwise_conv_engine.sv
+       - per-conv-layer ROM .sv + .mem files
+       - avg_pool_kx1.sv, flatten_unit.sv
+       - softmax_layer.sv  OR  argmax_layer.sv  (depends on ONNX final op)
+       - multiclass_NN.sv (top), multiclass_NN_wrapper.sv
+       - rtl_filelist.f, mapping_report.txt, netlist.json
+
+The Conv layers' ``Fin / Fout`` exponents are derived from the same QDQ chain
+walkers used for FC (``_fin_exponent_from_dq_chain`` / ``_fout_exponent_from_q_chain``
+imported from the binary script).
+
+Requires: ``onnxruntime`` (with quantization support), ``onnx``, ``numpy``.
+"""
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
+
+# -----------------------------------------------------------------------------
+# Path setup: locate sibling Binary_ONNX_to_RTL directory and add to sys.path so
+# we can reuse its layer-extraction helpers (Fin/Fout chain walkers, MatMul/Gemm
+# extractors, attach_inter_layer_scale_tensors_from_onnx_pair).
+# -----------------------------------------------------------------------------
+_THIS_DIR = Path(__file__).resolve().parent
+_BINARY_DIR_CANDIDATES = [
+    _THIS_DIR.parent / "pyramidstech" / "Binary_ONNX_to_RTL",
+    _THIS_DIR.parent.parent / "pyramidstech" / "Binary_ONNX_to_RTL",
+    Path(r"C:/Users/Kimo_/OneDrive - Alexandria University/Desktop/pyramidstech/Binary_ONNX_to_RTL"),
+]
+_BINARY_DIR: Optional[Path] = None
+for _cand in _BINARY_DIR_CANDIDATES:
+    if (_cand / "binary_onnx_to_rtl.py").is_file():
+        _BINARY_DIR = _cand.resolve()
+        break
+if _BINARY_DIR is None:
+    raise RuntimeError(
+        "Cannot locate sibling Binary_ONNX_to_RTL directory. "
+        "Searched: " + ", ".join(str(c) for c in _BINARY_DIR_CANDIDATES)
+    )
+if str(_BINARY_DIR) not in sys.path:
+    sys.path.insert(0, str(_BINARY_DIR))
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
+
+import binary_onnx_to_rtl as _bin_pipe  # noqa: E402
+import multiclass_rtl_mapper as mrm  # noqa: E402
+
+# Reuse the binary script's ONNX helpers verbatim — the FC handling is identical.
+_load_onnx = _bin_pipe._load_onnx
+_get_initializers_dict = _bin_pipe._get_initializers_dict
+_build_value_to_array = _bin_pipe._build_value_to_array
+_get_attr = _bin_pipe._get_attr
+_get_node_op_type = _bin_pipe._get_node_op_type
+_fin_exponent_from_dq_chain = _bin_pipe._fin_exponent_from_dq_chain
+_fout_exponent_from_q_chain = _bin_pipe._fout_exponent_from_q_chain
+_fin_scale_from_dq_chain = _bin_pipe._fin_scale_from_dq_chain
+_fout_scale_from_q_chain = _bin_pipe._fout_scale_from_q_chain
+_qdq_fin_fout_for_fc_node = _bin_pipe._qdq_fin_fout_for_fc_node
+extract_layers_from_onnx = _bin_pipe.extract_layers_from_onnx
+attach_inter_layer_scale_tensors_from_onnx_pair = _bin_pipe.attach_inter_layer_scale_tensors_from_onnx_pair
+extract_per_layer_activations = _bin_pipe.extract_per_layer_activations
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 LOGGER = logging.getLogger(__name__)
 
-# Resolve paths for imports
-_SCRIPT_DIR = Path(__file__).resolve().parent
-if str(_SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPT_DIR))
-_CONVERT_DIR = _SCRIPT_DIR.parent / "convert_model_to_RTL"
-_ONNX_LIB = _CONVERT_DIR / "onnx_lib"
-if _ONNX_LIB.is_dir() and str(_ONNX_LIB) not in sys.path:
-    sys.path.insert(0, str(_ONNX_LIB))
-if str(_CONVERT_DIR) not in sys.path:
-    sys.path.insert(0, str(_CONVERT_DIR))
+
+# =============================================================================
+# Conv layer extraction
+#
+# Walks the ONNX graph and pulls every Conv node into a ConvLayerInfo with float
+# weights/biases, kernel/stride/pad attributes, spatial dims (traced through the
+# graph), and Fin/Fout exponents from QDQ scales.  ``op_kind`` is "depthwise"
+# when kH > 1 or kW > 1, else "pointwise" (1x1 matches the existing engine
+# convention even though ONNX itself does not distinguish DW vs PW group=1).
+# =============================================================================
+
+def _classify_conv_op_kind(kH: int, kW: int) -> str:
+    """Pick which engine handles this conv.
+
+    1x1 → pointwise (multiplies in_ch values per cycle, sums across in_ch).
+    Otherwise → depthwise (line-buffer + sliding kH x kW window). Inputs with
+    in_ch > 1 are packed channel-fastest into the kernel-window dimension so the
+    same engine works without modification.
+    """
+    if kH == 1 and kW == 1:
+        return "pointwise"
+    return "depthwise"
 
 
-def _load_onnx(onnx_path: Path) -> Any:
-    import onnx
-    return onnx.load(str(onnx_path))
-
-
-def _get_initializers_dict(model: Any) -> Dict[str, np.ndarray]:
-    from onnx.numpy_helper import to_array
-    result = {}
-    for init in model.graph.initializer:
-        try:
-            arr = to_array(init)
-            result[init.name] = arr
-        except Exception as e:
-            LOGGER.warning(f"Could not load initializer {init.name}: {e}")
-    return result
-
-
-def _get_attr(node: Any, name: str, default: Any = None) -> Any:
-    for attr in node.attribute:
-        if attr.name == name:
-            if attr.type == 2:  # INT
-                return attr.i
-            if attr.type == 5:  # FLOAT
-                return attr.f
-            if attr.type == 1:  # FLOAT (legacy)
-                return attr.f
-    return default
-
-
-def _try_get_matmul_bias_from_add(
+def _trace_conv_activation(
     model: Any,
-    matmul_node: Any,
-    out_features: int,
+    conv_output_name: str,
+    input_to_nodes: Dict[str, List[Any]],
+) -> Optional[str]:
+    """Trace forward from a Conv output through Q/DQ to find the next activation
+    (Relu/Sigmoid/Tanh) — same logic as binary script's per-FC activation trace.
+    """
+    return _bin_pipe._trace_activation_forward(model, conv_output_name, input_to_nodes)
+
+
+def _conv_output_spatial(
+    in_h: int,
+    in_w: int,
+    kernel: Tuple[int, int],
+    stride: Tuple[int, int],
+    pad: Tuple[int, int, int, int],
+) -> Tuple[int, int]:
+    """Standard ONNX Conv output size formula.
+
+    pad = (top, left, bottom, right). For symmetric padding stored as [pad_h, pad_w]
+    we duplicate. Returns (out_h, out_w).
+    """
+    pad_h_total = pad[0] + pad[2]
+    pad_w_total = pad[1] + pad[3]
+    out_h = (in_h + pad_h_total - kernel[0]) // stride[0] + 1
+    out_w = (in_w + pad_w_total - kernel[1]) // stride[1] + 1
+    return out_h, out_w
+
+
+def _avgpool_output_spatial(
+    in_h: int,
+    in_w: int,
+    kernel: Tuple[int, int],
+    stride: Tuple[int, int],
+    pad: Tuple[int, int, int, int],
+) -> Tuple[int, int]:
+    pad_h_total = pad[0] + pad[2]
+    pad_w_total = pad[1] + pad[3]
+    out_h = (in_h + pad_h_total - kernel[0]) // stride[0] + 1
+    out_w = (in_w + pad_w_total - kernel[1]) // stride[1] + 1
+    return out_h, out_w
+
+
+def _conv_attrs(node: Any) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int, int, int], int]:
+    """Read kernel_shape / strides / pads / group from a Conv node, defaulting where missing."""
+    k = (1, 1)
+    s = (1, 1)
+    p = (0, 0, 0, 0)
+    g = 1
+    for attr in node.attribute:
+        if attr.name == "kernel_shape" and attr.type == 7:
+            ks = list(attr.ints)
+            if len(ks) >= 2:
+                k = (int(ks[0]), int(ks[1]))
+            elif len(ks) == 1:
+                k = (int(ks[0]), 1)
+        elif attr.name == "strides" and attr.type == 7:
+            ss = list(attr.ints)
+            if len(ss) >= 2:
+                s = (int(ss[0]), int(ss[1]))
+            elif len(ss) == 1:
+                s = (int(ss[0]), 1)
+        elif attr.name == "pads" and attr.type == 7:
+            pp = list(attr.ints)
+            if len(pp) >= 4:
+                p = (int(pp[0]), int(pp[1]), int(pp[2]), int(pp[3]))
+            elif len(pp) == 2:
+                p = (int(pp[0]), int(pp[1]), int(pp[0]), int(pp[1]))
+        elif attr.name == "group" and attr.type == 2:
+            g = int(attr.i)
+    return k, s, p, g
+
+
+def _resolve_conv_weight_4d(
+    model: Any,
+    weight_input_name: str,
     name_to_init: Dict[str, np.ndarray],
-) -> Optional[np.ndarray]:
-    matmul_out = matmul_node.output[0]
-    for node in model.graph.node:
-        if node.op_type != "Add" or len(node.input) < 2:
+) -> Tuple[np.ndarray, Optional[float], int, str]:
+    """Resolve a Conv's second input (weight) to a 4D float32 array.
+
+    Walks DequantizeLinear chains the same way ``_resolve_matmul_weight_tensor``
+    handles 2D MatMul weights — so quantized models with QDQ-wrapped Conv weights
+    are dequantized via the ONNX-stored scale (no hardcoded /128).
+
+    Returns ``(W_float, dq_scale, dq_zp, init_name)`` where ``dq_scale`` is None
+    for direct float initializers.
+    """
+    cur: Optional[str] = weight_input_name
+    visited: set[str] = set()
+    while cur is not None and cur not in visited:
+        visited.add(cur)
+        if cur in name_to_init:
+            w = name_to_init[cur].copy()
+            if w.ndim != 4:
+                raise RuntimeError(f"Conv weight {cur!r} is not 4D (got shape {w.shape})")
+            return w.astype(np.float32, copy=False), None, 0, cur
+
+        prod = _bin_pipe._producer_node_for_tensor(model, cur)
+        if prod is None:
+            raise RuntimeError(f"Cannot resolve Conv weight tensor {weight_input_name!r}: no producer found")
+        if prod.op_type == "DequantizeLinear":
+            ins = list(prod.input)
+            if len(ins) < 2:
+                raise RuntimeError(f"DequantizeLinear before Conv has < 2 inputs: {prod.name}")
+            qn, sn = ins[0], ins[1]
+            zn = ins[2] if len(ins) > 2 else None
+            if qn not in name_to_init or sn not in name_to_init:
+                raise RuntimeError(
+                    f"DequantizeLinear inputs missing initializer (q={qn!r}, scale={sn!r})"
+                )
+            scale_arr = name_to_init[sn]
+            if scale_arr.size != 1:
+                raise RuntimeError(
+                    f"DequantizeLinear before Conv: only scalar x_scale supported (got shape {scale_arr.shape})"
+                )
+            wq = name_to_init[qn].copy()
+            if wq.ndim != 4:
+                raise RuntimeError(f"Quantized conv weight {qn!r} is not 4D (got shape {wq.shape})")
+            sc = float(scale_arr.flatten()[0])
+            zp = int(name_to_init[zn].flatten()[0]) if zn and zn in name_to_init else 0
+            w_float = (wq.astype(np.float32) - float(zp)) * sc
+            return w_float, sc, zp, qn
+        if prod.op_type in ("Cast", "Identity") and prod.input:
+            cur = prod.input[0]
             continue
-        inputs = list(node.input)
-        if matmul_out not in inputs:
-            continue
-        other = inputs[1] if inputs[0] == matmul_out else inputs[0]
-        if other in name_to_init:
-            b = name_to_init[other].flatten()
-            if len(b) == out_features:
-                return b.astype(np.float32)
-        break
-    return None
+        raise RuntimeError(
+            f"Cannot resolve Conv weight tensor {weight_input_name!r}: producer {prod.op_type} not supported"
+        )
+    raise RuntimeError(f"Cannot resolve Conv weight tensor {weight_input_name!r}: visited all producers")
 
 
-def _build_value_to_array(model: Any, inits: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-    from onnx.numpy_helper import to_array
-    result: Dict[str, np.ndarray] = dict(inits)
-    for node in model.graph.node:
-        if node.op_type == "Reshape" and len(node.input) >= 2 and len(node.output) >= 1:
-            data_name, shape_name = node.input[0], node.input[1]
-            if data_name in result and shape_name in result:
-                data = result[data_name]
-                shape = result[shape_name].flatten().astype(np.int64)
-                out = np.reshape(data, shape)
-                result[node.output[0]] = out
-        elif node.op_type == "Constant" and len(node.output) >= 1:
-            for attr in node.attribute:
-                if attr.name == "value":
-                    result[node.output[0]] = to_array(attr.t)
-                    break
-    return result
+def extract_conv_layers_from_onnx(
+    onnx_path: Path,
+    *,
+    model_input_h: int,
+    model_input_w: int,
+    model_input_channels: int,
+) -> List[mrm.ConvLayerInfo]:
+    """Extract every Conv node from the ONNX graph as a ``ConvLayerInfo``.
 
+    Spatial dims are traced through the conv chain assuming the conv layers
+    appear in dataflow order before any AveragePool / flatten. The first conv's
+    in_h/in_w come from ``model_input_h/w`` (as resolved by ORT inputs).
 
-def extract_layers_from_onnx(onnx_path: Path) -> Tuple[List[Any], int, bool]:
-    """Extract FC layers and detect if Softmax follows the last FC. Returns (layers, input_size, has_softmax)."""
+    Per-layer activation is detected by tracing the conv output forward through
+    Q/DQ + Cast/Reshape until reaching a Relu/Sigmoid/Tanh.
+    """
     model = _load_onnx(onnx_path)
     inits = _get_initializers_dict(model)
     name_to_init = _build_value_to_array(model, inits)
 
-    layers: List[Dict[str, Any]] = []
-    input_size: Optional[int] = None
-    fc_counter = 0
-    last_fc_output_name: Optional[str] = None
+    input_to_nodes: Dict[str, List[Any]] = {}
+    for n in model.graph.node:
+        for inp in n.input:
+            input_to_nodes.setdefault(inp, []).append(n)
+
+    convs: List[mrm.ConvLayerInfo] = []
+    cur_h, cur_w, cur_c = model_input_h, model_input_w, model_input_channels
 
     for node in model.graph.node:
-        is_qlinear_matmul = node.op_type == "QLinearMatMul"
-        is_qlinear_gemm = node.op_type == "QLinearGemm"
+        if node.op_type != "Conv":
+            continue
+        ins = list(node.input)
+        if len(ins) < 2:
+            LOGGER.warning("Conv %s has < 2 inputs; skipping", node.name)
+            continue
+        weight_input = ins[1]
+        bias_input = ins[2] if len(ins) >= 3 else None
 
-        if node.op_type == "Gemm" or is_qlinear_matmul or is_qlinear_gemm:
-            fc_counter += 1
-            name = f"fc{fc_counter}"
-            inputs = list(node.input)
+        W_float, dq_scale, dq_zp, w_init_name = _resolve_conv_weight_4d(model, weight_input, name_to_init)
+        out_ch, in_ch, kH, kW = W_float.shape
+        kernel, stride, pad, group = _conv_attrs(node)
+        if (kH, kW) != kernel:
+            LOGGER.warning(
+                "%s: weight kernel shape (%d,%d) disagrees with attr kernel_shape %s — using weight shape.",
+                node.name, kH, kW, kernel,
+            )
+        op_kind = _classify_conv_op_kind(kH, kW)
 
-            if is_qlinear_matmul or is_qlinear_gemm:
-                if len(inputs) < 8:
-                    LOGGER.warning(f"{node.op_type} node {node.name} has < 8 inputs, skipping")
-                    continue
-                b_name = inputs[3]
-                b_scale_name = inputs[4]
-                b_zp_name = inputs[5]
-                bias_name = inputs[8] if len(inputs) >= 9 else None
-            else:
-                if len(inputs) < 2:
-                    LOGGER.warning(f"Gemm node {node.name} has < 2 inputs, skipping")
-                    continue
-                b_name = inputs[1]
-                bias_name = inputs[2] if len(inputs) > 2 else None
+        # Spatial trace
+        in_h_layer, in_w_layer = cur_h, cur_w
+        out_h, out_w = _conv_output_spatial(in_h_layer, in_w_layer, (kH, kW), stride, pad)
 
-            if b_name not in name_to_init:
-                LOGGER.warning(f"Weight {b_name} not in initializers, skipping")
-                continue
+        # Bias resolution: float initializer (or None → zeros)
+        if bias_input and bias_input in name_to_init:
+            bias_arr = name_to_init[bias_input].astype(np.float32).ravel()
+            if bias_arr.size != out_ch:
+                LOGGER.warning("%s: bias size %d != out_ch %d", node.name, bias_arr.size, out_ch)
+                bias_arr = np.resize(bias_arr, out_ch).astype(np.float32)
+        else:
+            bias_arr = np.zeros((out_ch,), dtype=np.float32)
 
-            w_np = name_to_init[b_name].copy()
-            if w_np.ndim != 2:
-                LOGGER.warning(f"Weight {b_name} is not 2D, skipping")
-                continue
+        # Fin / Fout from QDQ chains
+        fin_e = _fin_exponent_from_dq_chain(model, ins[0], name_to_init, set(), 0)
+        fout_e = _fout_exponent_from_q_chain(model, node.output[0], name_to_init, set(), 0)
+        fin_s = _fin_scale_from_dq_chain(model, ins[0], name_to_init, set(), 0)
+        fout_s = _fout_scale_from_q_chain(model, node.output[0], name_to_init, set(), 0)
 
-            if is_qlinear_matmul or is_qlinear_gemm:
-                b_scale = float(name_to_init[b_scale_name].flatten()[0]) if b_scale_name in name_to_init else 1.0
-                b_zp = int(name_to_init[b_zp_name].flatten()[0]) if b_zp_name in name_to_init else 0
-                w_np = (w_np.astype(np.float32) - b_zp) * b_scale
-            elif w_np.dtype in (np.int8, np.uint8, np.int16, np.uint16):
-                w_np = w_np.astype(np.float32) / 256.0
-            else:
-                w_np = w_np.astype(np.float32)
+        # Activation that follows
+        act = _trace_conv_activation(model, node.output[0], input_to_nodes)
 
-            in_features, out_features = w_np.shape
-            weight = w_np.T.astype(np.float32)
+        layer = mrm.ConvLayerInfo(
+            name=node.name or f"conv_{len(convs)+1}",
+            op_kind=op_kind,
+            in_channels=in_ch,
+            out_channels=out_ch,
+            kernel_h=kH,
+            kernel_w=kW,
+            stride_h=stride[0],
+            stride_w=stride[1],
+            pad_h=pad[0],
+            pad_w=pad[1],
+            weight=W_float,
+            bias=bias_arr,
+            qdq_fin_exp=fin_e,
+            qdq_fout_exp=fout_e,
+            qdq_fin_scale=fin_s,
+            qdq_fout_scale=fout_s,
+            activation=act,
+            in_h=in_h_layer,
+            in_w=in_w_layer,
+            out_h=out_h,
+            out_w=out_w,
+            onnx_node_name=node.name,
+            fc_output_name=node.output[0] if node.output else None,
+        )
+        convs.append(layer)
+        # Advance spatial state for the next conv: spatial dims from this conv's output;
+        # channel count = out_ch.
+        cur_h, cur_w, cur_c = out_h, out_w, out_ch
 
-            if not is_qlinear_matmul and not is_qlinear_gemm:
-                trans_b = _get_attr(node, "transB", 0)
-                alpha = _get_attr(node, "alpha", 1.0)
-                if trans_b:
-                    out_features, in_features = w_np.shape[0], w_np.shape[1]
-                    weight = w_np.astype(np.float32)
-                if alpha != 1.0:
-                    weight = weight * float(alpha)
+    return convs
 
-            bias_np: Optional[np.ndarray] = None
-            if bias_name and bias_name in name_to_init:
-                b_init = name_to_init[bias_name].flatten()
-                if is_qlinear_matmul or is_qlinear_gemm:
-                    bias_np = b_init.astype(np.float32)
-                elif b_init.dtype in (np.int8, np.uint8, np.int16, np.uint16):
-                    bias_np = b_init.astype(np.float32) / 256.0
-                else:
-                    bias_np = b_init.astype(np.float32)
-                if not is_qlinear_matmul and not is_qlinear_gemm:
-                    beta = _get_attr(node, "beta", 1.0)
-                    if beta != 1.0:
-                        bias_np = bias_np * float(beta)
-                if len(bias_np) != out_features:
-                    LOGGER.warning(f"Bias shape {bias_np.shape} != out_features {out_features}")
-                    bias_np = None
 
-            if bias_np is None:
-                bias_np = np.zeros((out_features,), dtype=np.float32)
+# =============================================================================
+# AveragePool detection
+# =============================================================================
 
-            if input_size is None:
-                input_size = in_features
+def _find_avgpool_node(model: Any) -> Optional[Any]:
+    """Return the first AveragePool / GlobalAveragePool node in the graph, or None."""
+    for node in model.graph.node:
+        if node.op_type in ("AveragePool", "GlobalAveragePool"):
+            return node
+    return None
 
-            layers.append({
-                "name": name,
-                "weight": weight,
-                "bias": bias_np,
-                "in_features": in_features,
-                "out_features": out_features,
-            })
-            last_fc_output_name = node.output[0] if node.output else None
 
-        elif node.op_type == "MatMul":
-            inputs = list(node.input)
-            if len(inputs) < 2:
-                continue
-            b_name = inputs[1]
-            if b_name not in name_to_init:
-                continue
-            w_np = name_to_init[b_name].copy()
-            if w_np.dtype in (np.int8, np.uint8, np.int16, np.uint16):
-                w_np = w_np.astype(np.float32) / 256.0
-            else:
-                w_np = w_np.astype(np.float32)
-            if w_np.ndim != 2:
-                continue
-            fc_counter += 1
-            in_features, out_features = w_np.shape
-            weight = w_np.T.astype(np.float32)
-            bias_np = _try_get_matmul_bias_from_add(model, node, out_features, name_to_init)
-            if bias_np is None:
-                bias_np = np.zeros((out_features,), dtype=np.float32)
-            if input_size is None:
-                input_size = in_features
-            layers.append({
-                "name": f"fc{fc_counter}",
-                "weight": weight,
-                "bias": bias_np,
-                "in_features": in_features,
-                "out_features": out_features,
-            })
-            last_fc_output_name = node.output[0] if node.output else None
+def _avgpool_attrs(node: Any) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int, int, int]]:
+    k = (1, 1)
+    s = (1, 1)
+    p = (0, 0, 0, 0)
+    for attr in node.attribute:
+        if attr.name == "kernel_shape" and attr.type == 7:
+            ks = list(attr.ints)
+            k = (int(ks[0]), int(ks[1])) if len(ks) >= 2 else (int(ks[0]), 1)
+        elif attr.name == "strides" and attr.type == 7:
+            ss = list(attr.ints)
+            s = (int(ss[0]), int(ss[1])) if len(ss) >= 2 else (int(ss[0]), 1)
+        elif attr.name == "pads" and attr.type == 7:
+            pp = list(attr.ints)
+            if len(pp) >= 4:
+                p = (int(pp[0]), int(pp[1]), int(pp[2]), int(pp[3]))
+            elif len(pp) == 2:
+                p = (int(pp[0]), int(pp[1]), int(pp[0]), int(pp[1]))
+    return k, s, p
 
-    # Check if Softmax consumes the last FC output
-    has_softmax = False
-    if last_fc_output_name:
-        for node in model.graph.node:
-            if node.op_type == "Softmax" and node.input and node.input[0] == last_fc_output_name:
-                has_softmax = True
-                LOGGER.info("Detected Softmax layer after final FC")
-                break
 
-    if input_size is None and layers:
-        input_size = layers[0]["in_features"]
-    if input_size is None:
-        input_size = 784  # Common fallback (e.g. MNIST 28x28)
+# =============================================================================
+# Final classifier op detection (Softmax / ArgMax)
+# =============================================================================
 
-    return layers, input_size, has_softmax
+def _detect_final_classifier_op(model: Any) -> str:
+    """Detect whether the model ends in Softmax or ArgMax (or fall back to "softmax").
+
+    Walks backward from the graph's first output, treating Q/DQ + Cast/Reshape as
+    transparent passthrough. Returns "softmax" or "argmax".
+    """
+    if not model.graph.output:
+        return "softmax"
+    output_to_node: Dict[str, Any] = {}
+    for node in model.graph.node:
+        for out in node.output:
+            output_to_node[out] = node
+    current = model.graph.output[0].name
+    visited: set[str] = set()
+    passthrough = {"Identity", "Cast", "Reshape", "Squeeze", "Unsqueeze",
+                   "QuantizeLinear", "DequantizeLinear"}
+    while current and current not in visited:
+        visited.add(current)
+        node = output_to_node.get(current)
+        if node is None:
+            return "softmax"
+        if node.op_type in ("Softmax", "LogSoftmax"):
+            return "softmax"
+        if node.op_type in ("ArgMax",):
+            return "argmax"
+        if node.op_type in passthrough and node.input:
+            current = node.input[0]
+        else:
+            return "softmax"
+    return "softmax"
+
+
+# =============================================================================
+# Model-level metadata: input shape (NCHW), num_classes (final FC out_features)
+# =============================================================================
+
+def _model_input_nchw(model: Any) -> Tuple[int, int, int, int]:
+    """Resolve the model's primary input shape as (N, C, H, W).
+
+    Symbolic / dynamic dims are pinned to 1 (matches calibration shape resolution).
+    Raises if rank != 4 — multiclass conv pipeline expects NCHW.
+    """
+    if not model.graph.input:
+        raise RuntimeError("Model has no graph inputs")
+    inp = model.graph.input[0]
+    dims = []
+    for d in inp.type.tensor_type.shape.dim:
+        if d.dim_value > 0:
+            dims.append(int(d.dim_value))
+        else:
+            dims.append(1)
+    if len(dims) != 4:
+        raise RuntimeError(f"Model input rank must be 4 (NCHW); got shape {dims}")
+    n, c, h, w = dims
+    return n, c, h, w
+
+
+def _conv_layers_to_pool_input(
+    conv_layers: List[mrm.ConvLayerInfo],
+) -> Tuple[int, int, int]:
+    """The (channels, h, w) feeding the AveragePool: take the last conv's output spatial
+    dims and out_channels.
+    """
+    if not conv_layers:
+        raise RuntimeError("No conv layers extracted; cannot derive pool input shape")
+    last = conv_layers[-1]
+    return last.out_channels, last.out_h, last.out_w
+
+
+# =============================================================================
+# Main pipeline (orchestrates calibrate → quantize → extract → emit)
+# =============================================================================
+
+def _build_synthetic_calibration_npz(
+    float_onnx: Path,
+    npz_out: Path,
+    *,
+    seed: int,
+    random_normal: Optional[int],
+    random_uniform: Optional[int],
+) -> None:
+    """Same as binary script: synthesize a calibration .npz from the float model's
+    input shapes; ORT reads this to choose static int8 scales.
+    """
+    import onnxruntime as ort
+
+    import multiclass_calib as mcb
+
+    sess = ort.InferenceSession(str(float_onnx), providers=["CPUExecutionProvider"])
+    shapes = mcb._collect_inputs(sess)
+    auto_n, auto_u = mcb.auto_random_sample_counts(shapes)
+    n_normal = auto_n if random_normal is None else max(0, random_normal)
+    n_uniform = auto_u if random_uniform is None else max(0, random_uniform)
+    LOGGER.info(
+        "Synthetic calibration: random-normal=%d random-uniform=%d seed=%d",
+        n_normal, n_uniform, seed,
+    )
+    stacked = mcb.build_calibration_batches(shapes, seed=seed, n_normal=n_normal, n_uniform=n_uniform)
+    npz_out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(npz_out, **stacked)
+
+
+def _quantize_float_to_qdq_int8(float_onnx: Path, calib_npz: Path, quant_onnx_out: Path) -> None:
+    """Run ORT static QDQ INT8 quantization. Inserts QuantizeLinear/DequantizeLinear
+    nodes around every Conv/FC weight and activation with calibrated scales.
+    """
+    import multiclass_quantize as oq
+    from onnxruntime.quantization import QuantFormat, QuantType, quantize_static
+
+    reader = oq.NpyCalibrationDataReader(float_onnx.resolve(), calib_npz.resolve())
+    quantize_static(
+        model_input=str(float_onnx.resolve()),
+        model_output=str(quant_onnx_out.resolve()),
+        calibration_data_reader=reader,
+        quant_format=QuantFormat.QDQ,
+        activation_type=QuantType.QInt8,
+        weight_type=QuantType.QInt8,
+    )
+
+
+def _enforce_conv_numeric_fidelity_or_warn(conv_layers: List[mrm.ConvLayerInfo]) -> None:
+    """Per-layer thresholds for power-of-two int8 quantization quality.
+
+    Logs a warning rather than raising — multiclass models often have wider
+    activation ranges than the binary FC-only models, so saturation > 1% is more
+    common but still tolerable. The ``--strict-fidelity`` CLI flag promotes
+    these to errors.
+    """
+    max_w_mae = 0.020
+    max_b_mae = 0.06
+    max_sat_pct = 5.0
+    for layer in conv_layers:
+        rq = layer.rtl_quant
+        if rq is None:
+            LOGGER.warning("%s: missing rtl_quant descriptor", layer.name)
+            continue
+        w_ref = np.asarray(rq.W_float, dtype=np.float64)
+        w_rec = np.asarray(rq.W_int, dtype=np.float64) * (2.0 ** (-int(rq.fw_frac)))
+        b_ref = np.asarray(rq.B_float, dtype=np.float64).ravel()
+        b_rec = np.asarray(rq.B_int, dtype=np.float64) * (2.0 ** (-int(rq.fb_rtl)))
+        w_mae = float(np.mean(np.abs(w_ref - w_rec))) if w_ref.size else 0.0
+        b_mae = float(np.mean(np.abs(b_ref - b_rec))) if b_ref.size else 0.0
+        if w_mae > max_w_mae:
+            LOGGER.warning("%s: conv weight MAE=%.5f > %.5f", layer.name, w_mae, max_w_mae)
+        if b_mae > max_b_mae:
+            LOGGER.warning("%s: conv bias   MAE=%.5f > %.5f", layer.name, b_mae, max_b_mae)
+        if rq.weight_sat_lo_pct > max_sat_pct or rq.weight_sat_hi_pct > max_sat_pct:
+            LOGGER.warning(
+                "%s: conv weight saturation lo/hi=%.2f%%/%.2f%% > %.2f%%",
+                layer.name, rq.weight_sat_lo_pct, rq.weight_sat_hi_pct, max_sat_pct,
+            )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Convert multiclass ONNX model (Gemm/MatMul FC layers) to RTL and .mem files",
+        description="Convert a multiclass ONNX classifier (Conv + FC) to RTL.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument(
-        "--onnx-model",
-        type=Path,
-        required=True,
-        help="Path to ONNX model file (.onnx)",
-    )
-    parser.add_argument(
-        "--out-dir",
-        type=Path,
-        required=True,
-        help="Output directory for RTL and .mem files (e.g., ./my_ip)",
-    )
-    parser.add_argument(
-        "--scale",
-        type=int,
-        default=256,
-        help="Scale factor for quantizing float weights (default: 256)",
-    )
-    parser.add_argument(
-        "--weight-format",
-        type=str,
-        choices=["int4", "int8", "int16"],
-        default=None,
-        help="Override auto-detected quantization (default: auto-detect from ONNX via detect_quant_type)",
-    )
-    parser.add_argument(
-        "--data-width",
-        type=int,
-        default=16,
-        help="Data width in bits (default: 16)",
-    )
-    parser.add_argument(
-        "--emit-testbench",
-        action="store_true",
-        help="Generate testbench",
-    )
-    parser.add_argument(
-        "--emit-rtl-legacy",
-        action="store_true",
-        help="Also emit legacy rtl/ flow outputs",
-    )
-    parser.add_argument(
-        "--rtl-structure",
-        type=str,
-        choices=["hierarchical", "flattened"],
-        default="hierarchical",
-        help="RTL structure: 'hierarchical' (separate modules) or 'flattened' (single inlined module). Default: hierarchical",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging",
-    )
-    parser.add_argument(
-        "--force-softmax",
-        action="store_true",
-        help="Add softmax layer even when ONNX model does not have Softmax (output probabilities instead of logits)",
-    )
-
+    parser.add_argument("--model", type=Path, required=True, help="Float32 ONNX model")
+    parser.add_argument("--out-dir", type=Path, required=True, help="Output directory for RTL + .mem files")
+    parser.add_argument("--calib-seed", type=int, default=42, help="RNG seed for synthetic calibration")
+    parser.add_argument("--calib-random-normal", type=int, default=None, metavar="N",
+                        help="Synthetic normal(0,0.2) batch count (default: auto)")
+    parser.add_argument("--calib-random-uniform", type=int, default=None, metavar="N",
+                        help="Synthetic uniform(-0.6,0.6) batch count (default: auto)")
+    parser.add_argument("--head", choices=("auto", "softmax", "argmax"), default="auto",
+                        help="Classifier head: auto = detect from ONNX final op (default)")
+    parser.add_argument("--strict-fidelity", action="store_true",
+                        help="Promote conv-quant fidelity warnings to errors")
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
-    onnx_path = args.onnx_model.resolve()
-    out_dir = args.out_dir.resolve()
-
-    if not onnx_path.exists():
-        LOGGER.error(f"ONNX model not found: {onnx_path}")
-        return 1
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # 1. Auto-detect quantization via detect_quant_type (from same directory)
-    from detect_quant_type import detect_quantization_type, quant_type_to_bits
-
-    if args.weight_format:
-        quant_type = args.weight_format
-        LOGGER.info(f"Using user-specified quantization: {quant_type}")
-    else:
-        quant_type = detect_quantization_type(onnx_path=onnx_path)
-        LOGGER.info(f"Auto-detected quantization: {quant_type}")
-
-    weight_format_bits = quant_type_to_bits(quant_type)
-
-    # 2. Extract FC layers from ONNX
-    LOGGER.info("Extracting layers from ONNX...")
-    layers_raw, input_size, has_softmax = extract_layers_from_onnx(onnx_path)
-    if args.force_softmax:
-        has_softmax = True
-        LOGGER.info("Forcing softmax layer (--force-softmax)")
-
-    if not layers_raw:
-        LOGGER.error(
-            "No Gemm/MatMul/QLinearMatMul/QLinearGemm layers found in ONNX model. "
-            "Multiclass models use FC layers."
-        )
+    float_path = args.model.resolve()
+    out_dir = args.out_dir.resolve()
+    if not float_path.is_file():
+        LOGGER.error("Model not found: %s", float_path)
         return 1
 
-    LOGGER.info(f"Found {len(layers_raw)} linear layers, input_size={input_size}")
-    last_out = layers_raw[-1]["out_features"]
-    LOGGER.info(f"Output classes: {last_out}")
+    weight_format_bits = 8
+    scale = 1 << weight_format_bits
 
-    # 3. Build LayerInfo and quantize
-    from rtl_mapper import (
-        LayerInfo,
-        float_to_int,
-        generate_quant_pkg_style_weight_mem,
-        generate_quant_pkg_style_bias_mem,
-        write_embedded_rtl_templates,
-        generate_weight_rom,
-        generate_bias_rom,
-        generate_fc_layer_wrapper,
-        generate_fc_out_layer,
-        generate_top_module,
-        generate_flattened_top_module,
-        generate_wrapper_module,
-        generate_testbench,
-        generate_mapping_report,
-        generate_netlist_json,
-        emit_legacy_rtl_outputs,
-    )
+    with tempfile.TemporaryDirectory(prefix="multiclass_onnx_to_rtl_") as tmp:
+        tdir = Path(tmp)
+        calib_npz = tdir / "synthetic_calib.npz"
+        quant_onnx = tdir / "quantized_qdq_int8.onnx"
 
-    layers: List[LayerInfo] = []
-    for lr in layers_raw:
-        w_np = lr["weight"].astype(np.float32)
-        b_np = lr["bias"].astype(np.float32)
-        layer = LayerInfo(
-            name=lr["name"],
-            layer_type="linear",
-            in_features=lr["in_features"],
-            out_features=lr["out_features"],
-            weight=torch.from_numpy(w_np),
-            bias=torch.from_numpy(b_np),
-        )
-        layers.append(layer)
-
-    flatten = LayerInfo(name="flatten_1", layer_type="flatten", out_shape=(1, input_size))
-    full_layers: List[LayerInfo] = [flatten]
-    for i, layer in enumerate(layers):
-        full_layers.append(layer)
-        if i < len(layers) - 1:
-            full_layers.append(LayerInfo(name=f"relu_{i+1}", layer_type="relu"))
-    if has_softmax:
-        full_layers.append(LayerInfo(name="softmax_1", layer_type="softmax"))
-    layers = full_layers
-
-    # 4. Setup output directories
-    out_dir.mkdir(parents=True, exist_ok=True)
-    sv_dir = out_dir / "src" / "rtl" / "systemverilog"
-    sv_dir.mkdir(parents=True, exist_ok=True)
-    mem_dir = sv_dir / "mem"
-    mem_dir.mkdir(parents=True, exist_ok=True)
-    tb_sim_dir = out_dir / "tb" / "sim"
-    tb_sim_dir.mkdir(parents=True, exist_ok=True)
-
-    # 5. Generate .mem files
-    LOGGER.info(f"Writing .mem files (int{weight_format_bits})...")
-    for layer in layers:
-        if layer.layer_type != "linear":
-            continue
-        w_np = layer.weight.detach().cpu().numpy().astype(np.float32)
-        b_np = layer.bias.detach().cpu().numpy().astype(np.float32) if layer.bias is not None else np.zeros((layer.out_features or 0,), dtype=np.float32)
-        wq = float_to_int(w_np, args.scale, weight_format_bits)
-        bq = float_to_int(b_np, args.scale, weight_format_bits)
-        weight_mem_path = mem_dir / f"{layer.name}_weights_packed.mem"
-        bias_mem_path = mem_dir / f"{layer.name}_biases.mem"
-        generate_quant_pkg_style_weight_mem(
-            wq, weight_mem_path, layer.name,
-            layer.in_features or 0, layer.out_features or 0,
-            weight_format_bits,
-        )
-        generate_quant_pkg_style_bias_mem(bq, bias_mem_path, layer.out_features or 0, weight_format_bits)
-        LOGGER.info(f"  {layer.name}: {layer.in_features} -> {layer.out_features}")
-
-    # 6. Emit legacy RTL if requested
-    if args.emit_rtl_legacy:
-        legacy_dir = out_dir.parent / "legacy_out" if out_dir.name == "my_ip" else out_dir / "legacy"
-        legacy_dir.mkdir(parents=True, exist_ok=True)
-        emit_legacy_rtl_outputs(
-            legacy_rtl_dir=legacy_dir,
-            layers=layers,
-            scale=args.scale,
-            bits_list=(4, 8, 16),
-            write_sv=False,
+        # ----- Step 1: Calibration -----
+        LOGGER.info("Step 1/3: building synthetic calibration npz...")
+        _build_synthetic_calibration_npz(
+            float_path, calib_npz,
+            seed=args.calib_seed,
+            random_normal=args.calib_random_normal,
+            random_uniform=args.calib_random_uniform,
         )
 
-    model_name = onnx_path.stem
-    use_flattened = args.rtl_structure == "flattened"
-    linear_layers = [l for l in layers if l.layer_type == "linear"]
-    if use_flattened and len(linear_layers) < 3:
-        LOGGER.warning(
-            f"Flattened RTL requires at least 3 FC layers; found {len(linear_layers)}. "
-            "Falling back to hierarchical structure."
+        # ----- Step 2: Static QDQ INT8 quantization -----
+        LOGGER.info("Step 2/3: static QDQ int8 quantization...")
+        try:
+            _quantize_float_to_qdq_int8(float_path, calib_npz, quant_onnx)
+        except Exception as e:
+            LOGGER.error("quantize_static failed: %s", e)
+            return 1
+
+        # ----- Step 3a: Resolve model-level shape & decide classifier head -----
+        float_model = _load_onnx(float_path)
+        n_in, c_in, h_in, w_in = _model_input_nchw(float_model)
+        if args.head == "auto":
+            head_kind = _detect_final_classifier_op(float_model)
+        else:
+            head_kind = args.head
+        LOGGER.info("Model input: NCHW=(%d,%d,%d,%d); classifier head=%s", n_in, c_in, h_in, w_in, head_kind)
+
+        # ----- Step 3b: Extract Conv layers from quantized ONNX -----
+        LOGGER.info("Step 3/3: extracting layers and emitting RTL...")
+        conv_layers = extract_conv_layers_from_onnx(
+            quant_onnx,
+            model_input_h=h_in,
+            model_input_w=w_in,
+            model_input_channels=c_in,
         )
-        use_flattened = False
+        if not conv_layers:
+            LOGGER.warning("No Conv layers extracted from %s — model may be FC-only.", quant_onnx.name)
 
-    # 7. Write embedded RTL templates
-    LOGGER.info("Writing RTL templates...")
-    write_embedded_rtl_templates(sv_dir, weight_format_bits, write_submodules=not use_flattened, has_softmax=has_softmax)
-
-    if use_flattened:
-        # 8a. Flattened: single inlined top module + wrapper
-        LOGGER.info("Generating flattened RTL structure...")
-        generate_flattened_top_module(
-            model_name, layers, input_size, args.data_width, weight_format_bits, sv_dir,
-            has_softmax=has_softmax,
+        # ----- Step 3c: Extract FC layers (reuse binary script) -----
+        # binary_onnx_to_rtl.extract_layers_from_onnx returns FC-only entries; for a
+        # mixed conv+FC model the conv outputs are NOT processed by this extractor
+        # (it ignores Conv nodes), so we get just the post-flatten FC chain.
+        fc_layers_raw, input_size_post_flatten, _final_act = extract_layers_from_onnx(
+            quant_onnx, allow_fout_backfill=False,
         )
-        generate_wrapper_module(model_name, layers, weight_format_bits, sv_dir, has_softmax=has_softmax)
-    else:
-        # 8b. Hierarchical: ROM, layer, and top modules
-        LOGGER.info("Generating hierarchical RTL structure...")
-        for layer in layers:
-            if layer.layer_type == "linear":
-                generate_weight_rom(layer.name, layer.in_features or 0, layer.out_features or 0, weight_format_bits, sv_dir)
-                generate_bias_rom(layer.name, layer.out_features or 0, weight_format_bits, sv_dir)
-                if layer.name == "fc1":
-                    generate_fc_layer_wrapper(
-                        layer.name, layer.in_features or 0, layer.out_features or 0,
-                        args.data_width, weight_format_bits, sv_dir,
-                    )
-                else:
-                    generate_fc_out_layer(
-                        layer.name, layer.out_features or 0, layer.in_features or 0, sv_dir,
-                    )
+        if not fc_layers_raw:
+            LOGGER.error("No Gemm/MatMul FC layers found — multiclass model expects FC after conv stack")
+            return 1
 
-        LOGGER.info("Generating top module...")
-        generate_top_module(model_name, layers, input_size, args.data_width, weight_format_bits, sv_dir, has_softmax=has_softmax)
+        # Backfill missing Fout on the last FC (no QuantizeLinear after Softmax)
+        for i in range(len(fc_layers_raw) - 1):
+            if fc_layers_raw[i].get("qdq_fout_exp") is None:
+                fc_layers_raw[i]["qdq_fout_exp"] = fc_layers_raw[i + 1].get("qdq_fin_exp")
+        if fc_layers_raw and fc_layers_raw[-1].get("qdq_fout_exp") is None:
+            fc_layers_raw[-1]["qdq_fout_exp"] = fc_layers_raw[-1].get("qdq_fin_exp")
 
-    # 10. Testbench
-    if args.emit_testbench:
-        last_fc = next((l for l in reversed(layers) if l.layer_type == "linear"), None)
-        if last_fc:
-            generate_testbench(model_name, input_size, last_fc.out_features or 0, weight_format_bits, tb_sim_dir)
+        # Build LayerInfo list (linear-only) for the FC chain.
+        fc_layers: List[mrm.LayerInfo] = []
+        for lr in fc_layers_raw:
+            w_np = lr["weight"].astype(np.float32)
+            b_np = lr["bias"].astype(np.float32)
+            layer = mrm.LayerInfo(
+                name=lr["name"],
+                layer_type="linear",
+                in_features=lr["in_features"],
+                out_features=lr["out_features"],
+                weight=np.asarray(w_np, dtype=np.float32),
+                bias=np.asarray(b_np, dtype=np.float32),
+                quant_params=lr.get("quant_params"),
+                activation=lr.get("activation"),
+                qdq_fin_exp=lr.get("qdq_fin_exp"),
+                qdq_fout_exp=lr.get("qdq_fout_exp"),
+                onnx_add_b_quantized=lr.get("onnx_add_b_quantized"),
+            )
+            qpm = dict(layer.quant_params) if isinstance(layer.quant_params, dict) else {}
+            qpm["qdq_fin_scale"] = lr.get("qdq_fin_scale")
+            qpm["qdq_fout_scale"] = lr.get("qdq_fout_scale")
+            layer.quant_params = qpm
+            fc_layers.append(layer)
 
-    # 11. Reports
-    frac_bits = 8
-    generate_mapping_report(out_dir, model_name, layers, args.scale, args.data_width, weight_format_bits, 32, frac_bits)
-    generate_netlist_json(out_dir, model_name, layers)
+        # ----- Step 3d: AveragePool detection + spatial inference -----
+        avg_node = _find_avgpool_node(float_model)
+        pool_channels, pool_in_h, pool_in_w = _conv_layers_to_pool_input(conv_layers) if conv_layers else (1, 1, 1)
+        if avg_node is None:
+            LOGGER.warning("No AveragePool node found; using kernel=1, stride=1, frame_rows=%d", pool_in_h)
+            pool_kernel = 1
+            pool_stride = 1
+            pool_out_rows = pool_in_h
+        else:
+            (kP, _kw_pool), (sP, _sw_pool), pP = _avgpool_attrs(avg_node)
+            out_h, _ = _avgpool_output_spatial(pool_in_h, pool_in_w, (kP, _kw_pool), (sP, _sw_pool), pP)
+            pool_kernel = kP
+            pool_stride = sP
+            pool_out_rows = out_h
+        flatten_size = pool_channels * pool_out_rows
+        # Sanity check: flatten_size must equal first FC's INPUT_SIZE
+        if fc_layers and fc_layers[0].in_features and int(fc_layers[0].in_features) != int(flatten_size):
+            LOGGER.warning(
+                "Flatten size %d != first FC.in_features %d — conv/pool spatial trace may not match the first FC.",
+                flatten_size, fc_layers[0].in_features,
+            )
 
-    LOGGER.info(f"Multiclass RTL generation complete! Output: {out_dir}")
+        # ----- Step 3e: Build RTL quant descriptors -----
+        if conv_layers:
+            mrm.build_rtl_conv_quant_descriptors(conv_layers, bit_width=weight_format_bits)
+            _enforce_conv_numeric_fidelity_or_warn(conv_layers)
+
+        # FC: attach paired float/int tensors so build_rtl_layer_quant_descriptors works.
+        # For multiclass we only have the quantized ONNX; the float ONNX (without QDQ) gives
+        # the "true" weights. Use the same attach helper as binary script.
+        flatten = mrm.LayerInfo(name="flatten_1", layer_type="flatten",
+                                out_shape=(1, int(flatten_size)))
+        full_fc_chain: List[mrm.LayerInfo] = [flatten]
+        for i, lyr in enumerate(fc_layers):
+            full_fc_chain.append(lyr)
+            if i < len(fc_layers) - 1:
+                full_fc_chain.append(mrm.LayerInfo(name=f"fc_relu_{i+1}", layer_type="relu"))
+        try:
+            attach_inter_layer_scale_tensors_from_onnx_pair(full_fc_chain, quant_onnx, float_path)
+        except RuntimeError as e:
+            LOGGER.warning("Inter-layer ONNX pair attach failed: %s — falling back to weight tensor only.", e)
+        mrm.build_rtl_layer_quant_descriptors(fc_layers, bit_width=weight_format_bits, log_summary=False)
+
+        # ----- Step 3f: Emit the RTL IP -----
+        out_dir.mkdir(parents=True, exist_ok=True)
+        num_classes = int(fc_layers[-1].out_features) if fc_layers else 1
+        mrm.emit_multiclass_format(
+            out_dir,
+            conv_layers,
+            full_fc_chain,
+            final_op_kind=head_kind,
+            num_classes=num_classes,
+            pool_kernel=pool_kernel,
+            pool_stride=pool_stride,
+            pool_frame_rows=pool_in_h,
+            pool_channels=pool_channels,
+            pool_out_rows=pool_out_rows,
+            flatten_size=int(flatten_size),
+            weight_width=weight_format_bits,
+            scale=scale,
+        )
+        mrm.generate_multiclass_rtl_filelist(
+            out_dir, float_path.stem, conv_layers, fc_layers, final_op_kind=head_kind,
+        )
+        mrm.generate_multiclass_mapping_report(
+            out_dir, float_path.stem, conv_layers, fc_layers,
+            final_op_kind=head_kind,
+            num_classes=num_classes,
+            pool_kernel=pool_kernel,
+            pool_stride=pool_stride,
+            pool_frame_rows=pool_in_h,
+            pool_out_rows=pool_out_rows,
+            flatten_size=int(flatten_size),
+            weight_width=weight_format_bits,
+        )
+        mrm.generate_multiclass_netlist_json(
+            out_dir, float_path.stem, conv_layers, fc_layers,
+            final_op_kind=head_kind,
+            num_classes=num_classes,
+        )
+        LOGGER.info("Multiclass RTL generation complete! Output: %s", out_dir)
     return 0
 
 
