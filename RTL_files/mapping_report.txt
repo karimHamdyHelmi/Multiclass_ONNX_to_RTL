@@ -12,7 +12,7 @@ Convolution layers:
      Fin=7  Fw=6  Fb=13  Fout=5  LAYER_SCALE=8  BIAS_SCALE=0
      w_sat(lo,hi)=(0.00%,0.00%)  b_sat(lo,hi)=(0.00%,0.00%)
   conv2d_proj_out                pointwise  in_ch=  2 out_ch= 32 K=1x1  stride=1x1
-     Fin=5  Fw=7  Fb=12  Fout=7  LAYER_SCALE=5  BIAS_SCALE=0
+     Fin=5  Fw=7  Fb=8  Fout=7  LAYER_SCALE=5  BIAS_SCALE=4
      w_sat(lo,hi)=(0.00%,0.00%)  b_sat(lo,hi)=(0.00%,0.00%)
   conv2d_1_proj_in               pointwise  in_ch= 32 out_ch=  2 K=1x1  stride=1x1
      Fin=7  Fw=7  Fb=14  Fout=4  LAYER_SCALE=10  BIAS_SCALE=0

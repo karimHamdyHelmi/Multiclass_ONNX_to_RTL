@@ -55,7 +55,7 @@
       "activation": null,
       "fin_qdq": 5,
       "fw_frac": 7,
-      "fb_rtl": 12,
+      "fb_rtl": 8,
       "fout_qdq": 7,
       "layer_scale": 5
     },

@@ -7,10 +7,11 @@ Takes per-layer Conv + FC weight/bias arrays (with quantization metadata) and em
 synthesizable SystemVerilog modules plus ``.mem`` weight/bias ROM files for a complete
 multiclass classifier IP.
 
-**Pipeline overview (matches binary script convention but extended for Conv layers):**
+**Pipeline overview:**
 
-1. **Fixed-point quantization** (``build_rtl_conv_quant_descriptors`` / FC reuse) — convert float32
-   weights/biases to power-of-two int8 (W_int, B_int) with exponents Fw, Fb.
+1. **Fixed-point quantization** (``build_rtl_conv_quant_descriptors`` and the FC
+   chain helpers) — convert float32 weights/biases to power-of-two int8
+   (W_int, B_int) with exponents Fw, Fb.
 
 2. **Scale derivation** — derive per-layer ``LAYER_SCALE = (Fin + Fw) - Fout`` and
    ``BIAS_SCALE = (Fin + Fw) - Fb``, expressed as signed integer right-/left-shifts.
@@ -19,20 +20,19 @@ multiclass classifier IP.
      - depthwise_conv_engine.sv    : single ROM row, ``NUM_FILTERS * (K_H * K_W * K_C) * Q_WIDTH`` bits
      - pointwise_conv_engine.sv    : single ROM row, ``NUM_FILTERS * INPUTS_PER_CYCLE * Q_WIDTH`` bits
      - conv bias ROMs              : single ROM row, ``NUM_FILTERS * BIAS_WIDTH`` bits (sign-extended int32)
-     - fc_in / fc_out ROMs         : reuse binary script packing (see binary rtl_mapper.py)
+     - fc_in / fc_out ROMs         : LSB-first packing shared across the FC chain.
 
 4. **SystemVerilog emission** (``emit_multiclass_format``) — write the entire IP:
-     - Reused from binary script: quant_pkg.sv, mac.sv, fc_in.sv, fc_out.sv,
+     - Shared infrastructure: quant_pkg.sv, mac.sv, fc_in.sv, fc_out.sv,
        fc_in_layer.sv, fc_out_layer.sv, relu_layer.sv, sync_fifo.sv
-     - New (multiclass-specific): line_buffers.sv, depthwise_conv_engine.sv,
+     - Conv-side modules: line_buffers.sv, depthwise_conv_engine.sv,
        pointwise_conv_engine.sv, avg_pool_kx1.sv, flatten_unit.sv,
        softmax_layer.sv / argmax_layer.sv (chosen from ONNX final op),
        multiclass_NN.sv (top module), multiclass_NN_wrapper.sv
 
-The script imports shared infrastructure from the binary script's ``rtl_mapper.py``
-(found in the sibling ``Binary_ONNX_to_RTL`` directory).  This avoids duplicating ~3000
-lines of proven FC chain code while letting the multiclass mapper add only conv-specific
-emitters and the new top-module template.
+This module is fully self-contained: every helper, SV template, and ROM packer it
+needs to convert a multiclass Conv + FC ONNX classifier into RTL lives in this
+file.
 """
 from __future__ import annotations
 
@@ -47,64 +47,2283 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-# -----------------------------------------------------------------------------
-# Locate and import shared infrastructure from the binary script's rtl_mapper.
-# This is the sibling project at <pyramidstech>/Binary_ONNX_to_RTL/rtl_mapper.py
-# from which we reuse: LayerInfo, RtlLayerQuantDescriptor, header utilities,
-# weight/bias quantization, FC mem packers, scale alignment helpers, and the
-# proven SV templates for quant_pkg / mac / fc_in / fc_out / relu / sync_fifo.
-# -----------------------------------------------------------------------------
-_THIS_DIR = Path(__file__).resolve().parent
-_BINARY_DIR_CANDIDATES = [
-    _THIS_DIR.parent / "pyramidstech" / "Binary_ONNX_to_RTL",
-    _THIS_DIR.parent.parent / "pyramidstech" / "Binary_ONNX_to_RTL",
-    Path(r"C:/Users/Kimo_/OneDrive - Alexandria University/Desktop/pyramidstech/Binary_ONNX_to_RTL"),
-]
-_BINARY_DIR: Optional[Path] = None
-for _cand in _BINARY_DIR_CANDIDATES:
-    if (_cand / "rtl_mapper.py").is_file():
-        _BINARY_DIR = _cand.resolve()
-        break
-if _BINARY_DIR is None:
-    raise RuntimeError(
-        "Cannot locate sibling Binary_ONNX_to_RTL directory containing rtl_mapper.py. "
-        "Searched: " + ", ".join(str(c) for c in _BINARY_DIR_CANDIDATES)
-    )
-if str(_BINARY_DIR) not in sys.path:
-    sys.path.insert(0, str(_BINARY_DIR))
-
-import rtl_mapper as _bin_rtl  # noqa: E402
-
-# Re-export the names we use directly in this module (and in multiclass_onnx_to_rtl.py).
-LayerInfo = _bin_rtl.LayerInfo
-RtlLayerQuantDescriptor = _bin_rtl.RtlLayerQuantDescriptor
-quantize_weight_for_rtl = _bin_rtl.quantize_weight_for_rtl
-quantize_bias_for_rtl = _bin_rtl.quantize_bias_for_rtl
-build_rtl_layer_quant_descriptors = _bin_rtl.build_rtl_layer_quant_descriptors
-compute_layer_scales_from_rtl_descriptors = _bin_rtl.compute_layer_scales_from_rtl_descriptors
-_qdq_pair_bias_alignment = _bin_rtl._qdq_pair_bias_alignment
-_qdq_pair_layer_alignment = _bin_rtl._qdq_pair_layer_alignment
-_rtl_signed_bias_scale = _bin_rtl._rtl_signed_bias_scale
-_rtl_signed_layer_scale = _bin_rtl._rtl_signed_layer_scale
-_pyramidtech_wrap = _bin_rtl._pyramidtech_wrap
-_pyramidtech_header = _bin_rtl._pyramidtech_header
-_get_quant_pkg_content = _bin_rtl._get_quant_pkg_content
-_write_embedded_sv = _bin_rtl._write_embedded_sv
-generate_proj_mem_files = _bin_rtl.generate_proj_mem_files
-_proj_prefix = _bin_rtl._proj_prefix
-_generate_binaryclass_nn_rom = _bin_rtl._generate_binaryclass_nn_rom
-_generate_fc_in_layer_binaryclass = _bin_rtl._generate_fc_in_layer_binaryclass
-_generate_fc_out_layer_binaryclass = _bin_rtl._generate_fc_out_layer_binaryclass
-_compute_binaryclass_nn_params = _bin_rtl._compute_binaryclass_nn_params
-
-BINARYCLASS_MAC_SV = _bin_rtl.BINARYCLASS_MAC_SV
-BINARYCLASS_FC_IN_SV = _bin_rtl.BINARYCLASS_FC_IN_SV
-BINARYCLASS_FC_OUT_SV = _bin_rtl.BINARYCLASS_FC_OUT_SV
-BINARYCLASS_RELU_LAYER_SV = _bin_rtl.BINARYCLASS_RELU_LAYER_SV
-BINARYCLASS_SYNC_FIFO_SV = _bin_rtl.BINARYCLASS_SYNC_FIFO_SV
-
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 LOGGER = logging.getLogger(__name__)
+
+# =============================================================================
+# PyramidTech Header Utilities
+# Every generated .sv file starts with a proprietary header block.  These helpers
+# produce the header text and wrap module bodies with `begin_keywords / end_keywords.
+# =============================================================================
+
+def _pyramidtech_header(file_name: str, description: str, *, author: str = "Ahmed Abou-Auf", quant_pkg_style: bool = False) -> str:
+    """Generate PyramidTech proprietary header block."""
+    desc_lines = description.strip().split("\n")
+    if len(desc_lines) == 1:
+        desc_block = desc_lines[0].strip()
+    else:
+        first = desc_lines[0].strip()
+        rest = "\n".join("                " + line.strip() for line in desc_lines[1:] if line.strip())
+        desc_block = first + "\n" + rest if rest else first
+    closing = "***************************************************************************************/" if quant_pkg_style else "****************************************************************************************/"
+    return f'''/****************************************************************************************
+"PYRAMIDTECH CONFIDENTIAL
+
+Copyright (c) 2026 PyramidTech LLC. All rights reserved.
+
+This file contains proprietary and confidential information of PyramidTech LLC.
+The information contained herein is unpublished and subject to trade secret
+protection. No part of this file may be reproduced, modified, distributed,
+transmitted, disclosed, or used in any form or by any means without the
+prior written permission of PyramidTech LLC.
+
+This material must be returned immediately upon request by PyramidTech LLC"
+/****************************************************************************************
+File name:      {file_name}
+  
+Description:    {desc_block}
+  
+Author:         {author}
+  
+Change History:
+02-25-2026     AA  Initial Release
+  
+{closing}
+'''
+
+
+# -----------------------------------------------------------------------------
+# RTL content wrapping (PyramidTech headers)
+# -----------------------------------------------------------------------------
+
+def _pyramidtech_wrap(content: str, file_name: str, description: str, *, author: str = "Ahmed Abou-Auf", quant_pkg_style: bool = False) -> str:
+    """Prepend PyramidTech header, wrap with begin_keywords/end_keywords, and return RTL content."""
+    header = _pyramidtech_header(file_name, description, author=author, quant_pkg_style=quant_pkg_style)
+    body = content.rstrip()
+    # Strip existing begin_keywords/end_keywords to avoid duplication
+    body = re.sub(r'^`begin_keywords\s+"[^"]*"\s*\n?', '', body)
+    body = re.sub(r'\n?`end_keywords\s*$', '', body)
+    body = body.strip()
+    return header + '`begin_keywords "1800-2012"\n\n' + body + '\n\n`end_keywords'
+
+
+# Header descriptions for embedded reusable .sv bodies
+_FILE_DESCRIPTIONS = {
+    "mac.sv": "Pipelined Multiply-Accumulate (MAC) unit with output saturation",
+    "fc_in.sv": "Fully-connected (FC) input layer module. Instantiates MAC units, adds biases, and applies layer scaling with output saturation.",
+    "fc_out.sv": "Fully-connected (FC) output layer module with a 3-stage pipeline: Stage 1 (Multiplication), Stage 2 (Addition/Scaling), and Stage 3 (Saturation/Output).",
+    "relu_layer.sv": "ReLU activation function applied element-wise to a single input. Passes input directly if positive; outputs zero if negative.",
+    "sync_fifo.sv": "Synchronous FIFO module for data buffering. Uses a standard pointer-based implementation with full/empty flags",
+}
+
+
+def _write_embedded_sv(sv_dir: Path, filename: str, body: str) -> None:
+    """Write one SystemVerilog file from embedded body with PyramidTech header."""
+    desc = _FILE_DESCRIPTIONS.get(filename, "")
+    content = _pyramidtech_wrap(body, filename, desc)
+    (sv_dir / filename).write_text(content.rstrip() + "\n", encoding="utf-8")
+
+
+# =============================================================================
+# Quantization Helpers and Core Data Types
+#
+# LayerInfo — carrier for everything the generator needs about one FC layer:
+#   weights, biases, ONNX quantization metadata, paired float/int tensors,
+#   and the computed RTL descriptor (set after build_rtl_layer_quant_descriptors).
+#
+# RtlLayerQuantDescriptor — per-layer output of the fixed-point conversion:
+#   int8 W_int / B_int arrays, exponents Fw / Fb / Fin / Fout, saturation stats,
+#   and the optional ONNX-pair Fb used for bias scale alignment.
+#
+# The quantization approach is "power-of-two gain": we find the largest integer
+# exponent F such that round(x * 2^F) fits entirely within [-128, 127] with no
+# clipping.  This makes the hardware shift-friendly (LAYER_SCALE / BIAS_SCALE
+# are simple arithmetic right-/left-shifts).
+# =============================================================================
+
+def float_to_int(val: np.ndarray, scale: int, bit_width: int) -> np.ndarray:
+    """Quantize float tensors with integer ``scale``: round(val * scale), clip (fallback path).
+
+    Primary ONNX→RTL path uses :func:`build_rtl_layer_quant_descriptors` + power-of-two
+    :func:`quantize_weight_for_rtl` / :func:`quantize_bias_for_rtl`; :func:`mem_export_weight_matrix`
+    reads ``layer.rtl_quant`` when present.
+    """
+    if bit_width == 4:
+        min_val, max_val = -8, 7
+        dtype = np.int8
+    elif bit_width == 8:
+        min_val, max_val = -128, 127
+        dtype = np.int8
+    elif bit_width == 16:
+        min_val, max_val = -32768, 32767
+        dtype = np.int16
+    else:
+        raise ValueError(f"Unsupported bit width: {bit_width}. Supported: 4, 8, 16")
+
+    quantized = np.clip(np.round(val.astype(np.float32) * float(scale)), min_val, max_val)
+    return quantized.astype(dtype)
+
+
+@dataclass
+class LayerInfo:
+    """Everything the RTL generator needs about one layer in the model.
+
+    For linear (FC) layers the key fields are:
+      - weight / bias: float32 arrays (dequantized from ONNX or original float).
+      - qdq_fin_exp / qdq_fout_exp: activation exponents from ORT QDQ scales.
+      - onnx_pair_*: matched float+int tensors from both the float and quantized
+        ONNX — used to derive Fw/Fb exponents for the RTL shift parameters.
+      - rtl_quant: the final RtlLayerQuantDescriptor (set after
+        build_rtl_layer_quant_descriptors runs).
+
+    Non-linear layers (flatten, relu) are placeholders that carry only name + type.
+    """
+    name: str
+    layer_type: str  # 'flatten', 'linear', 'relu'
+    module_qualname: Optional[str] = None
+    in_features: Optional[int] = None
+    out_features: Optional[int] = None
+    weight: Optional[np.ndarray] = None
+    bias: Optional[np.ndarray] = None
+    in_shape: Optional[Tuple[int, ...]] = None
+    out_shape: Optional[Tuple[int, ...]] = None
+    quant_params: Optional[Dict[str, Any]] = None  # ONNX: weight_scale, b_zero_point, etc.
+    activation: Optional[str] = None  # ONNX: Relu, Sigmoid, Tanh, etc. (from graph trace)
+    # Static QDQ / QLinear: exponents from ONNX quant scales (see `_qdq_fin_fout_for_fc_node`).
+    qdq_fin_exp: Optional[int] = None
+    qdq_fout_exp: Optional[int] = None
+    # Optional: float vs integer tensors 
+    onnx_pair_float_weight: Optional[np.ndarray] = None
+    onnx_pair_float_bias: Optional[np.ndarray] = None
+    onnx_pair_quant_weight: Optional[np.ndarray] = None
+    onnx_pair_quant_bias: Optional[np.ndarray] = None
+    onnx_pair_weight_scale: Optional[float] = None  # scalar view (legacy compatibility)
+    onnx_pair_weight_scale_arr: Optional[np.ndarray] = None  # full ONNX weight scale tensor (supports per-channel)
+    # Static QDQ: int8 bias initializer ``{MatMulNodePrefix}_Add_B_quantized`` (same shape as bias vector).
+    onnx_add_b_quantized: Optional[np.ndarray] = None
+    # Unified RTL fixed-point (built after attach): .mem and LAYER_SCALE/BIAS_SCALE use this one descriptor.
+    rtl_quant: Optional["RtlLayerQuantDescriptor"] = None
+
+
+@dataclass
+class RtlLayerQuantDescriptor:
+    """Per-layer fixed-point descriptor: the bridge between float ONNX and hardware ROM.
+
+    Created by ``build_rtl_layer_quant_descriptors`` for every FC layer.  Contains:
+      - W_int / B_int: the actual int8 values written to .mem ROM files.
+      - fw_frac / fb_rtl: power-of-two exponents (W ≈ W_int * 2^-fw_frac).
+      - fin_qdq / fout_qdq: activation exponents from ORT QDQ scales.
+      - fb_pair: alternative Fb from the ONNX float/int tensor pair (when present).
+      - saturation percentages: how many elements hit the int8 clip limits.
+
+    The shift values that parameterise fc_in/fc_out are derived from these exponents
+    by ``compute_layer_scales_from_rtl_descriptors``.
+    """
+
+    layer_name: str
+    layer_index: int
+    W_float: np.ndarray  # (out_features, in_features)
+    B_float: np.ndarray
+    onnx_weight_scale: Optional[float]
+    onnx_weight_zp: Optional[Any]  # from quant_params b_zero_point (ONNX metadata; not ROM zp)
+    weight_init_name: Optional[str]  # e.g. MatMulInteger weight_scale initializer name
+    # Chosen RTL convention: W_int ≈ round(W_float * 2^fw_frac), clip to int8
+    fw_frac: int
+    W_int: np.ndarray
+    weight_sat_lo_pct: float
+    weight_sat_hi_pct: float
+    # Bias: B_int uses fb_rtl (F_mac = Fin + fw_frac).
+    fin_qdq: int
+    fb_rtl: int
+    B_int: np.ndarray
+    bias_sat_lo_pct: float
+    bias_sat_hi_pct: float
+    fout_qdq: int
+    bias_clipped_for_int8: bool
+    # ONNX-pair Fb from ONNX float/quant pair when present (scales / Add_B shift); None if no pair.
+    fb_pair: Optional[int] = None
+
+    @property
+    def fb_frac(self) -> int:
+        """Effective Fb for ONNX-pair scale rows: pair Fb when present, else RTL bias exponent (matches ``B_int`` domain)."""
+        return int(self.fb_pair) if self.fb_pair is not None else int(self.fb_rtl)
+
+
+def _saturation_pct_int(arr: np.ndarray, lo: int, hi: int) -> Tuple[float, float]:
+    a = np.asarray(arr, dtype=np.int32).ravel()
+    n = max(a.size, 1)
+    return (100.0 * float(np.sum(a <= lo)) / n, 100.0 * float(np.sum(a >= hi)) / n)
+
+
+def quantize_weight_for_rtl(
+    W_float: np.ndarray,
+    *,
+    lo: int = -128,
+    hi: int = 127,
+) -> Tuple[int, np.ndarray, float, float]:
+    """
+    Pick the largest integer fw_frac >= 0 such that round(W_float * 2^fw_frac) fits in [lo, hi]
+    with **no clipping** (same as handwritten-style fixed-point: power-of-two gain, shift-friendly).
+
+    Returns (fw_frac, W_int, sat_lo_pct, sat_hi_pct) — sat should be 0.0 when unclipped.
+    """
+    W = np.asarray(W_float, dtype=np.float64)
+    max_abs = float(np.max(np.abs(W)))
+    if max_abs < 1e-15:
+        z = np.zeros(W.shape, dtype=np.int32)
+        return 0, z, 0.0, 0.0
+    F = int(np.floor(np.log2(hi / max_abs)))
+    F = max(0, min(F, 24))
+    while F >= 0:
+        raw = np.rint(W * (2.0**F))
+        if np.all((raw >= lo) & (raw <= hi)):
+            wq = raw.astype(np.int32)
+            sl, sh = _saturation_pct_int(wq, lo, hi)
+            return F, wq, sl, sh
+        F -= 1
+    raw = np.rint(W)
+    wq = np.clip(raw, lo, hi).astype(np.int32)
+    sl, sh = _saturation_pct_int(wq, lo, hi)
+    LOGGER.warning(
+        "quantize_weight_for_rtl: could not fit without clip at any power-of-two F; clipped at F=0 (layer max_abs=%.6g)",
+        max_abs,
+    )
+    return 0, wq, sl, sh
+
+
+def quantize_bias_for_rtl(
+    B_float: np.ndarray,
+    F_mac: int,
+    *,
+    lo: int = -128,
+    hi: int = 127,
+    layer_name: str = "",
+) -> Tuple[int, np.ndarray, bool]:
+    """
+    Quantize float bias (ONNX, post-matmul add) to int8 for ROM.
+
+    **RTL (fc_in / fc_out):** ``bias_*`` is sign-extended int8 in ``acc_t``. ``BIAS_SCALE`` shifts the bias
+    so it matches the MAC sum domain (``F_mac = Fin + Fw``). ``LAYER_SCALE`` is applied after bias + MAC.
+
+    **Quantization rule (reference-style):** At each candidate ``Fb``, use **per-element**
+    conversion: **nearest integer** (``rint``) if it lies in int8 range, otherwise **truncate toward zero**
+    (``trunc``) if that lies in range. This avoids lowering **global** ``Fb`` (which would force
+    ``BIAS_SCALE = F_mac - F_b != 0``) when only a few elements would round to ±128 under ``rint`` but
+    fit with ``trunc`` at ``Fb = F_mac`` — the usual cause of ``FC_*_OUT_BIAS_SCALE = 1`` vs reference ``0``.
+
+    Returns (fb_frac, B_int, was_clipped).
+    """
+    B = np.asarray(B_float, dtype=np.float64).ravel()
+    if B.size == 0:
+        return F_mac, np.zeros(0, dtype=np.int32), False
+
+    f_hi = max(0, min(int(F_mac), 24))
+    for Fb in range(f_hi, -1, -1):
+        scaled = B * (2.0**Fb)
+        rr = np.rint(scaled)
+        rt = np.trunc(scaled)
+        in_r = (rr >= lo) & (rr <= hi)
+        in_t = (rt >= lo) & (rt <= hi)
+        if np.all(in_r | in_t):
+            out = np.where(in_r, rr, rt).astype(np.int32)
+            return Fb, out, False
+
+    LOGGER.warning(
+        "%s: no Fb in [0..%s] fits per-element rint/trunc; clipping at Fb=0.",
+        layer_name or "layer",
+        f_hi,
+    )
+    scaled = B * 1.0
+    rr = np.rint(scaled)
+    rt = np.trunc(scaled)
+    in_r = (rr >= lo) & (rr <= hi)
+    pre = np.where(in_r, rr, rt)
+    clipped = np.clip(pre, lo, hi).astype(np.int32)
+    return 0, clipped, True
+
+
+def build_rtl_layer_quant_descriptors(
+    linear_layers: List[LayerInfo],
+    *,
+    bit_width: int = 8,
+    log_summary: bool = True,
+    log_detail: bool = False,
+) -> List[RtlLayerQuantDescriptor]:
+    """
+    Build per-layer RTL quantization from **float** weights/biases (dequant ONNX or float model).
+    Weights: ``quantize_weight_for_rtl`` (power-of-two int8, unchanged).
+
+    **proj_in** bias ``.mem``: ``B_int`` from ``quantize_bias_for_rtl(B_float, Fin+Fw_rtl)``, sign-extended.
+
+    **proj_out** bias ``.mem``: export ONNX ``*_Add_B_quantized`` sign-extended to ``acc_t`` when present
+    (graph truth); otherwise use descriptor-domain ``rq.B_int`` sign-extended to ``acc_t``.
+
+    **Descriptor**: ``fb_rtl`` quantizes ``B_int``; ``fb_pair`` is ONNX-pair Fb when ONNX pair exists.
+    ``fb_frac`` property is ``fb_pair`` if set else ``fb_rtl`` (for ``_qdq_pair_bias_alignment`` / scales).
+
+    ``FC_*_*_LAYER_SCALE``: ``compute_layer_scales_from_rtl_descriptors`` uses ``_qdq_pair_alignment`` on ONNX
+    QDQ ``Fin``/``Fout`` and ONNX-pair ``Fw``/``Fb`` for all blocks (including odd-tail last block).
+
+    ``log_detail``: per-layer Fin/Fw/Fb and min/max logs.
+    """
+    if bit_width != 8:
+        raise NotImplementedError("build_rtl_layer_quant_descriptors currently supports bit_width=8 only")
+    lo, hi = -128, 127
+    out: List[RtlLayerQuantDescriptor] = []
+    for i, layer in enumerate(linear_layers):
+        if layer.qdq_fin_exp is None or layer.qdq_fout_exp is None:
+            raise RuntimeError(
+                f"{layer.name}: missing Fin/Fout exponents from quantized ONNX (qdq_fin_exp / qdq_fout_exp). "
+                "Export with static QDQ (``onnx_quantize.py``: quantize_static, QuantFormat.QDQ) or use "
+                "QLinearMatMul/QLinearGemm so activation scales appear as graph initializers."
+            )
+        fin = abs(int(layer.qdq_fin_exp))
+        fout = abs(int(layer.qdq_fout_exp))
+        if layer.onnx_pair_float_weight is not None:
+            Wf = np.asarray(layer.onnx_pair_float_weight, dtype=np.float64)
+        elif layer.weight is not None:
+            Wf = np.asarray(layer.weight, dtype=np.float64)
+        else:
+            raise RuntimeError(f"{layer.name}: need onnx_pair_float_weight or weight for RTL quant")
+        if layer.onnx_pair_float_bias is not None:
+            Bf = np.asarray(layer.onnx_pair_float_bias, dtype=np.float64).ravel()
+        elif layer.bias is not None:
+            Bf = np.asarray(layer.bias, dtype=np.float64).ravel()
+        else:
+            Bf = np.zeros((layer.out_features or 0,), dtype=np.float64)
+
+        qp = layer.quant_params if isinstance(layer.quant_params, dict) else {}
+        onnx_ws = qp.get("weight_scale")
+        if onnx_ws is None:
+            onnx_ws = layer.onnx_pair_weight_scale
+        onnx_zp = qp.get("b_zero_point")
+        w_init = qp.get("weight_scale_init_name")
+
+        fw_frac, W_int, wsl, wsh = quantize_weight_for_rtl(Wf, lo=lo, hi=hi)
+        f_mac = fin + fw_frac
+
+        fb_rtl, B_int, b_clip = quantize_bias_for_rtl(Bf, f_mac, lo=lo, hi=hi, layer_name=layer.name)
+        bsl, bsh = _saturation_pct_int(B_int, lo, hi)
+        fb_pair: Optional[int] = None
+        if _layer_has_full_onnx_pair(layer):
+            _, fb_pair = _fw_fb_pair_exponents_from_onnx_pair(layer, fin)
+
+        desc = RtlLayerQuantDescriptor(
+            layer_name=layer.name,
+            layer_index=i,
+            W_float=Wf.astype(np.float64),
+            B_float=Bf.astype(np.float64),
+            onnx_weight_scale=float(onnx_ws) if onnx_ws is not None else None,
+            onnx_weight_zp=onnx_zp,
+            weight_init_name=str(w_init) if w_init is not None else None,
+            fw_frac=fw_frac,
+            W_int=W_int,
+            weight_sat_lo_pct=wsl,
+            weight_sat_hi_pct=wsh,
+            fin_qdq=fin,
+            fb_rtl=fb_rtl,
+            B_int=B_int,
+            bias_sat_lo_pct=bsl,
+            bias_sat_hi_pct=bsh,
+            fout_qdq=fout,
+            bias_clipped_for_int8=b_clip,
+            fb_pair=fb_pair,
+        )
+        out.append(desc)
+        layer.rtl_quant = desc
+
+        if log_detail:
+            pair_note = ""
+            if _layer_has_full_onnx_pair(layer):
+                fwp, _ = _fw_fb_pair_exponents_from_onnx_pair(layer, fin)
+                pair_note = f" | ONNX-pair_Fw(ONNX)={fwp} for BIAS_SCALE rows (ROM weight Fw={fw_frac})"
+            LOGGER.info(
+                "rtl_quant %s: Fin=%d Fw=%d F_mac=%d Fb_rtl=%d Fb_pair=%s Fout=%d | W_float[min,max]=[%.6g,%.6g] W_int[min,max]=[%d,%d] "
+                "w_sat(lo,hi)=(%.2f%%,%.2f%%) | B_float[min,max]=[%.6g,%.6g] B_int[min,max]=[%d,%d] b_sat=(%.2f%%,%.2f%%)%s%s",
+                layer.name,
+                fin,
+                fw_frac,
+                f_mac,
+                fb_rtl,
+                str(fb_pair) if fb_pair is not None else "—",
+                fout,
+                float(Wf.min()),
+                float(Wf.max()),
+                int(W_int.min()),
+                int(W_int.max()),
+                wsl,
+                wsh,
+                float(Bf.min()) if Bf.size else 0.0,
+                float(Bf.max()) if Bf.size else 0.0,
+                int(B_int.min()) if B_int.size else 0,
+                int(B_int.max()) if B_int.size else 0,
+                bsl,
+                bsh,
+                " ONNX_scale=%s" % (onnx_ws,) if onnx_ws is not None else "",
+                pair_note,
+            )
+        if wsl > 1.0 or wsh > 1.0 or bsl > 1.0 or bsh > 1.0:
+            LOGGER.warning(
+                "rtl_quant %s: saturation > 1%% after power-of-two quant — inspect float range.",
+                layer.name,
+            )
+
+    if log_summary and log_detail:
+        LOGGER.info("--- rtl_quant summary (power-of-two ROM, unified with Fw/Fb for shifts) ---")
+        for d in out:
+            LOGGER.info(
+                "  %s: 2^Fw weights Fw=%d | bias Fb_rtl=%d Fb_pair=%s | W_int range [%d,%d]",
+                d.layer_name,
+                d.fw_frac,
+                d.fb_rtl,
+                str(d.fb_pair) if d.fb_pair is not None else "—",
+                int(d.W_int.min()),
+                int(d.W_int.max()),
+            )
+    elif log_summary and not log_detail:
+        LOGGER.debug(
+            "rtl_quant: built %d layer descriptor(s) (power-of-two ROM; use --verbose for Fin/Fw/Fb details).",
+            len(out),
+        )
+    return out
+
+
+def compute_layer_scales_from_rtl_descriptors(
+    linear_layers: List[LayerInfo],
+    descriptors: List[RtlLayerQuantDescriptor],
+) -> Dict[str, int]:
+    """LAYER_SCALE/BIAS_SCALE from RTL ROM exponents (fw_frac / fb_frac).
+
+    Policy:
+    - Fin/Fout from QDQ exponents on each layer descriptor.
+    - Fw from ``quantize_weight_for_rtl`` (``d.fw_frac``): the actual ROM weight exponent.
+    - Fb from ``d.fb_frac`` (ONNX-pair Fb when present, else ``fb_rtl``).
+    - Single alignment rule for all rows/layers (no topology-specific exceptions).
+    """
+    if len(descriptors) != len(linear_layers):
+        raise ValueError("descriptor count must match linear layer count")
+    n = len(linear_layers)
+    rows: List[Dict[str, Any]] = []
+    for i, (layer, d) in enumerate(zip(linear_layers, descriptors)):
+        fw_rom = int(d.fw_frac)
+        fb_rom = int(d.fb_frac)
+        bsc, bdir = _qdq_pair_bias_alignment(d.fin_qdq, fw_rom, fb_rom)
+        lsc, ldir = _qdq_pair_layer_alignment(int(d.fin_qdq), fw_rom, int(d.fout_qdq))
+        rows.append(
+            {
+                "Fin": d.fin_qdq,
+                "Fw": fw_rom,
+                "Fb": fb_rom,
+                "Fout": d.fout_qdq,
+                "biasScale": bsc,
+                "biasDir": bdir,
+                "layerScale": lsc,
+                "layerDir": ldir,
+            }
+        )
+    num_blocks = (n + 1) // 2
+    result: Dict[str, int] = {}
+    for b in range(num_blocks):
+        in_idx = 2 * b
+        out_idx = 2 * b + 1 if 2 * b + 1 < n else None
+        rin = rows[in_idx]
+        rout = rows[out_idx] if out_idx is not None else rin
+        prefix = f"FC_{b + 1}"
+        result[f"{prefix}_IN_LAYER_SCALE"] = _rtl_signed_layer_scale(rin["layerScale"], rin["layerDir"])
+        result[f"{prefix}_IN_BIAS_SCALE"] = _rtl_signed_bias_scale(rin["biasScale"], rin["biasDir"])
+        result[f"{prefix}_OUT_LAYER_SCALE"] = _rtl_signed_layer_scale(rout["layerScale"], rout["layerDir"])
+        result[f"{prefix}_OUT_BIAS_SCALE"] = _rtl_signed_bias_scale(rout["biasScale"], rout["biasDir"])
+    if n % 2 == 1 and num_blocks >= 1:
+        last_i = n - 1
+        dlast = descriptors[last_i]
+        prev = linear_layers[last_i - 1] if last_i > 0 else None
+        if prev is not None and prev.qdq_fout_exp is not None:
+            fin_o = abs(int(prev.qdq_fout_exp))
+        else:
+            fin_o = int(dlast.fin_qdq)
+        fw_tail_out = 0
+        lsc_o, ldir_o = _qdq_pair_layer_alignment(fin_o, fw_tail_out, dlast.fout_qdq)
+        p_last = f"FC_{num_blocks}"
+        result[f"{p_last}_OUT_LAYER_SCALE"] = _rtl_signed_layer_scale(lsc_o, ldir_o)
+        result[f"{p_last}_OUT_BIAS_SCALE"] = 0
+    for k in list(result.keys()):
+        raw_v = int(result[k])
+        if raw_v < -24 or raw_v > 24:
+            raise RuntimeError(f"Scale parameter {k} out of supported range [-24,24]: {raw_v}")
+        result[k] = raw_v
+    return result
+
+
+def _fc_layer_scales_unified_or_legacy(
+    linear_layers: List[LayerInfo],
+    weight_width: int,
+    python_scale: int,
+) -> Tuple[Dict[str, int], str]:
+    """Return (scales dict, tag) using ``rtl_quant`` when present, else ONNX-pair inter-layer rows."""
+    descs_rtl = [L.rtl_quant for L in linear_layers if L.rtl_quant is not None]
+    if len(descs_rtl) == len(linear_layers) and linear_layers:
+        return compute_layer_scales_from_rtl_descriptors(linear_layers, descs_rtl), "rtl_quant_unified"
+    return compute_fc_layer_scales(linear_layers, weight_width, python_scale), "onnx_mode_legacy"
+
+
+def _clip_to_bitwidth(w: np.ndarray, bit_width: int) -> np.ndarray:
+    w = np.asarray(w, dtype=np.int32)
+    if bit_width == 4:
+        return np.clip(w, -8, 7)
+    if bit_width == 8:
+        return np.clip(w, -128, 127)
+    if bit_width == 16:
+        return np.clip(w, -32768, 32767)
+    raise ValueError(f"Unsupported bit_width {bit_width}")
+
+
+def mem_export_weight_matrix(
+    layer: LayerInfo,
+    bit_width: int,
+    rom_bias_quantize_scale: int,
+) -> Tuple[np.ndarray, np.ndarray, str]:
+    """
+    ROM integers for .mem. Prefer ``layer.rtl_quant`` (power-of-two float→int8, same Fw/Fb as
+    ``compute_layer_scales_from_rtl_descriptors``). Missing descriptor is treated as an error to
+    avoid silent fallback quantization policy drift.
+    """
+    if layer.weight is None:
+        raise RuntimeError(f"Layer {layer.name} missing weight")
+
+    rq = layer.rtl_quant
+    if rq is not None:
+        wq = _clip_to_bitwidth(np.asarray(rq.W_int, dtype=np.int32), bit_width)
+        bq = _clip_to_bitwidth(np.asarray(rq.B_int, dtype=np.int32), bit_width)
+        return wq, bq, "rtl_power2_unified"
+    raise RuntimeError(
+        f"{layer.name}: missing rtl_quant descriptor for .mem export. "
+        "Run build_rtl_layer_quant_descriptors before generation."
+    )
+
+
+def log_mem_export_debug(
+    layer_name: str,
+    wq: np.ndarray,
+    bq: np.ndarray,
+    source_tag: str,
+    *,
+    bit_width: int = 8,
+    onnx_weight_scale: Optional[float] = None,
+    onnx_zp: Optional[Any] = None,
+) -> None:
+    """Saturation and range stats for exported .mem tensors (weights + biases)."""
+    wq = np.asarray(wq, dtype=np.int32)
+    bq = np.asarray(bq, dtype=np.int32).ravel()
+    lo, hi = (-128, 127) if bit_width == 8 else (-8, 7) if bit_width == 4 else (-32768, 32767)
+    nw = wq.size
+    pct_lo = 100.0 * float(np.sum(wq <= lo)) / max(nw, 1)
+    pct_hi = 100.0 * float(np.sum(wq >= hi)) / max(nw, 1)
+    nb = max(bq.size, 1)
+    pct_b_lo = 100.0 * float(np.sum(bq <= lo)) / nb
+    pct_b_hi = 100.0 * float(np.sum(bq >= hi)) / nb
+    extra = ""
+    if onnx_weight_scale is not None:
+        extra += f" onnx_w_scale={onnx_weight_scale}"
+    if onnx_zp is not None:
+        extra += f" onnx_w_zp={onnx_zp}"
+    LOGGER.info(
+        "mem_debug %s: src=%s w[%d] min/max=%s/%s sat_lo=%.2f%% sat_hi=%.2f%% | b[%d] min/max=%s/%s sat_lo=%.2f%% sat_hi=%.2f%%%s",
+        layer_name,
+        source_tag,
+        nw,
+        int(wq.min()) if nw else 0,
+        int(wq.max()) if nw else 0,
+        pct_lo,
+        pct_hi,
+        bq.size,
+        int(bq.min()) if bq.size else 0,
+        int(bq.max()) if bq.size else 0,
+        pct_b_lo,
+        pct_b_hi,
+        extra,
+    )
+    if pct_lo > 1.0 or pct_hi > 1.0 or pct_b_lo > 1.0 or pct_b_hi > 1.0:
+        LOGGER.warning(
+            "mem_debug %s: saturation > 1%% on weights or biases — check ONNX vs ROM quantization path.",
+            layer_name,
+        )
+
+
+def mem_saturation_summary(wq: np.ndarray, bq: np.ndarray, bit_width: int = 8) -> Dict[str, Any]:
+    """Structured stats for validation scripts (no file I/O)."""
+    wq = np.asarray(wq, dtype=np.int32).ravel()
+    bq = np.asarray(bq, dtype=np.int32).ravel()
+    lo, hi = (-128, 127) if bit_width == 8 else (-8, 7) if bit_width == 4 else (-32768, 32767)
+    nw = max(wq.size, 1)
+    nb = max(bq.size, 1)
+    return {
+        "weight_n": int(wq.size),
+        "weight_min": int(wq.min()) if wq.size else 0,
+        "weight_max": int(wq.max()) if wq.size else 0,
+        "weight_sat_lo_pct": 100.0 * float(np.sum(wq <= lo)) / nw,
+        "weight_sat_hi_pct": 100.0 * float(np.sum(wq >= hi)) / nw,
+        "bias_n": int(bq.size),
+        "bias_min": int(bq.min()) if bq.size else 0,
+        "bias_max": int(bq.max()) if bq.size else 0,
+        "bias_sat_lo_pct": 100.0 * float(np.sum(bq <= lo)) / nb,
+        "bias_sat_hi_pct": 100.0 * float(np.sum(bq >= hi)) / nb,
+    }
+
+
+# =============================================================================
+# Memory File Generation (.mem format for weights and biases)
+#
+# .mem files are plain-text hex dumps loaded by $readmemh in the SV ROMs.
+# Two packing strategies exist:
+#
+#   proj_in (fc_in_layer):
+#     - weights: one hex line per input-feature index; each line packs all
+#       neurons' int8 weights for that input (neuron 0 in LSBs).
+#     - bias:    single hex line packing all neurons' biases, each sign-extended
+#       from int8 to acc_t (4*Q_WIDTH bits).
+#
+#   proj_out (fc_out_layer):
+#     - weights: one hex line per output neuron; each line packs all input
+#       weights for that neuron (input 0 in LSBs).
+#     - bias:    one hex line per output neuron; each value is a full acc_t
+#       (32-bit) integer, quantized directly from the float bias into the
+#       accumulator domain (F_acc = Fin_act + Fw_rom).
+#
+# The asymmetry between proj_in and proj_out bias formats is intentional:
+# proj_in uses int8 biases with BIAS_SCALE shifts, while proj_out bypasses
+# BIAS_SCALE by quantizing the bias at the exact accumulator exponent.
+# =============================================================================
+
+def generate_quant_pkg_style_weight_mem(
+    weight_matrix: np.ndarray,
+    out_path: Path,
+    layer_name: str,
+    in_features: int,
+    out_features: int,
+    bit_width: int
+) -> None:
+    """Generate weight .mem in quant_pkg format."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    weight_matrix = np.asarray(weight_matrix, dtype=np.int32)
+    mask = (1 << bit_width) - 1
+
+    with out_path.open("w", encoding="utf-8") as wf:
+        if layer_name == "fc1":
+            num_neurons = out_features
+            total_bits = num_neurons * bit_width
+            hex_width = (total_bits + 3) // 4
+            for j in range(in_features):
+                packed = 0
+                for neuron_idx in range(num_neurons):
+                    val = int(weight_matrix[neuron_idx, j]) & mask
+                    packed |= val << (neuron_idx * bit_width)
+                wf.write(f"{packed:0{hex_width}X}\n")
+        else:
+            num_inputs = in_features
+            total_bits = num_inputs * bit_width
+            hex_width = (total_bits + 3) // 4
+            for neuron_idx in range(out_features):
+                packed = 0
+                for inp_idx in range(num_inputs):
+                    val = int(weight_matrix[neuron_idx, inp_idx]) & mask
+                    packed |= val << (inp_idx * bit_width)
+                wf.write(f"{packed:0{hex_width}X}\n")
+
+
+def generate_quant_pkg_style_bias_mem(
+    bias_vector: np.ndarray,
+    out_path: Path,
+    num_neurons: int,
+    bit_width: int
+) -> None:
+    """Generate bias .mem in quant_pkg format: single line, all biases packed (neuron 0 in LSBs)."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    bias_vector = np.asarray(bias_vector, dtype=np.int32)
+    mask = (1 << bit_width) - 1
+    total_bits = num_neurons * bit_width
+    hex_width = (total_bits + 3) // 4
+    packed = 0
+    for neuron_idx in range(num_neurons):
+        val = int(bias_vector[neuron_idx]) & mask
+        packed |= val << (neuron_idx * bit_width)
+    with out_path.open("w", encoding="utf-8") as bf:
+        bf.write(f"{packed:0{hex_width}X}\n")
+
+
+def bias_int8_rom_to_acc_per_neuron(bias_int8: np.ndarray, bit_width: int) -> np.ndarray:
+    """
+    Sign-extend int8 ``B_int`` (``quantize_bias_for_rtl``) to ``acc_t`` width for **proj_in** packed bias
+    and for **proj_out** when using the descriptor ``B_int`` path.
+    """
+    bias_int8 = np.asarray(bias_int8, dtype=np.int32).ravel()
+    mask = (1 << bit_width) - 1
+    out = np.zeros(bias_int8.size, dtype=np.int64)
+    for i in range(bias_int8.size):
+        val = int(bias_int8[i]) & mask
+        if val >= (1 << (bit_width - 1)):
+            val = val - (1 << bit_width)
+        out[i] = val
+    return out
+
+
+def _acc_bitpattern_to_signed(v: int, acc_width: int) -> int:
+    """Interpret ``v`` as ``acc_width``-bit two's complement (handles uint32-style -1 == 0xffffffff)."""
+    mask_u = (1 << acc_width) - 1
+    u = int(v) & mask_u
+    sign = 1 << (acc_width - 1)
+    return u - (1 << acc_width) if (u & sign) else u
+
+
+def quantize_bias_to_acc_domain(
+    bias_float: np.ndarray,
+    acc_exp: int,
+    acc_width: int,
+) -> np.ndarray:
+    """Quantize float bias vector to the full acc_t domain: round(B * 2^acc_exp), clip to signed acc_width."""
+    raw = np.rint(np.asarray(bias_float, dtype=np.float64).ravel() * (2.0 ** int(acc_exp)))
+    min_acc = -(1 << (int(acc_width) - 1))
+    max_acc = (1 << (int(acc_width) - 1)) - 1
+    return np.clip(raw, min_acc, max_acc).astype(np.int64)
+
+
+def proj_out_bias_rom_values(
+    layer: LayerInfo,
+    bit_width: int,
+    *,
+    fin_act_exp: int,
+    mem_label: str = "",
+) -> np.ndarray:
+    """Per-neuron ``acc_t`` integers for ``*_proj_out_bias.mem``.
+
+    Rebuilds bias from ``rq.B_float`` into the emitted accumulator domain
+    (``F_acc = fin_act_exp + rq.fw_frac``), using the full ``acc_t`` width.
+    """
+    rq = layer.rtl_quant
+    if rq is None:
+        raise RuntimeError(f"{layer.name}: rtl_quant required for proj_out bias export")
+    acc_w = 4 * bit_width
+    f_acc = int(fin_act_exp) + int(rq.fw_frac)
+    b_float = np.asarray(rq.B_float, dtype=np.float64).ravel()
+    out = quantize_bias_to_acc_domain(b_float, f_acc, acc_w)
+    LOGGER.debug(
+        "proj_out_bias %s%s: rebuilt_from_float fin_act=%d fw_rom=%d f_acc=%d exported[min,max]=[%s,%s]",
+        layer.name,
+        f" ({mem_label})" if mem_label else "",
+        fin_act_exp,
+        rq.fw_frac,
+        f_acc,
+        int(out.min()) if out.size else "—",
+        int(out.max()) if out.size else "—",
+    )
+    return out
+
+
+def quantize_output_bias_for_acc_rom(
+    layer: LayerInfo,
+    bit_width: int,
+    *,
+    fin_act_exp: int,
+    mem_label: str = "",
+) -> np.ndarray:
+    """Same as :func:`proj_out_bias_rom_values` (optional ``mem_label`` for log context)."""
+    return proj_out_bias_rom_values(layer, bit_width, fin_act_exp=fin_act_exp, mem_label=mem_label)
+
+
+def generate_proj_bias_mem_acc(
+    bias_vector: np.ndarray,
+    out_path: Path,
+    num_neurons: int,
+    bit_width: int,
+) -> None:
+    """Generate bias .mem for fc_in (acc_t packed): one row, each bias sign-extended to 4*bit_width."""
+    acc_width = 4 * bit_width
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    bias_vector = np.asarray(bias_vector, dtype=np.int32)
+    mask = (1 << bit_width) - 1
+    total_bits = num_neurons * acc_width
+    hex_width = (total_bits + 3) // 4
+    packed = 0
+    for neuron_idx in range(num_neurons):
+        val = int(bias_vector[neuron_idx]) & mask
+        if val >= (1 << (bit_width - 1)):
+            val = val - (1 << bit_width)
+        val_acc = val & ((1 << acc_width) - 1)
+        packed |= val_acc << (neuron_idx * acc_width)
+    with out_path.open("w", encoding="utf-8") as bf:
+        bf.write(f"{packed:0{hex_width}X}\n")
+
+
+def generate_proj_out_bias_mem(
+    bias_vector: np.ndarray,
+    out_path: Path,
+    bit_width: int,
+) -> None:
+    """Write fc_out bias ROM: one hex line per address, full ``acc_t`` width (``proj_out_bias_rom_values``)."""
+    acc_width = 4 * bit_width
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    bias_vector = np.asarray(bias_vector, dtype=np.int64).ravel()
+    min_acc = -(1 << (acc_width - 1))
+    max_acc = (1 << (acc_width - 1)) - 1
+    hex_width = (acc_width + 3) // 4
+    mask_u = (1 << acc_width) - 1
+    with out_path.open("w", encoding="utf-8") as bf:
+        for v in bias_vector:
+            vi_s = _acc_bitpattern_to_signed(int(v), acc_width)
+            if vi_s < min_acc or vi_s > max_acc:
+                LOGGER.warning(
+                    "generate_proj_out_bias_mem: bias %s outside signed acc_t range [%s,%s]; clipping",
+                    vi_s,
+                    min_acc,
+                    max_acc,
+                )
+                vi_s = max(min_acc, min(max_acc, vi_s))
+            val_acc = vi_s & mask_u
+            bf.write(f"{val_acc:0{hex_width}X}\n")
+
+
+def _proj_prefix(layer_idx: int) -> str:
+    """ROM/file prefix: fc_proj for block 0, fc_2_proj for block 1, fc_3_proj for block 2, ..."""
+    if layer_idx == 0:
+        return "fc_proj"
+    return f"fc_{layer_idx + 1}_proj"
+
+
+def _fc_proj_mem_relpaths(linear_layer_index: int) -> Tuple[str, str]:
+    """Paths (from RTL root) for paired FC blocks: even idx → *_in_*, odd → *_out_*."""
+    b = linear_layer_index // 2
+    prefix = _proj_prefix(b)
+    if linear_layer_index % 2 == 0:
+        return (
+            f"mem_files/{prefix}_in_weights.mem",
+            f"mem_files/{prefix}_in_bias.mem",
+        )
+    return (
+        f"mem_files/{prefix}_out_weights.mem",
+        f"mem_files/{prefix}_out_bias.mem",
+    )
+
+
+def generate_proj_mem_files(
+    layers: List[LayerInfo],
+    mem_dir: Path,
+    scale: int,
+    bit_width: int,
+    *,
+    debug_mem: bool = False,
+) -> None:
+    """Write all .mem files for the FC chain block structure.
+
+    Each block b produces four ROM files:
+      - fc[_N]_proj_in_weights.mem  — packed int8 weights for the first half (fc_in)
+      - fc[_N]_proj_in_bias.mem     — packed acc_t biases for fc_in (sign-extended int8)
+      - fc[_N]_proj_out_weights.mem — packed int8 weights for the second half (fc_out)
+      - fc[_N]_proj_out_bias.mem    — per-neuron acc_t biases for fc_out (quantized from float)
+
+    Layer pairing: block 0 = (fc1, fc2), block 1 = (fc3, fc4), ...
+    If N is odd the last block pairs fcN with a 1x1 identity weight matrix.
+    """
+    linear_layers = [l for l in layers if l.layer_type == "linear"]
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    # Pair consecutively: (fc1,fc2), (fc3,fc4), ...; odd N: last block has (fcN, None) -> 1x1 proj_out
+    n = len(linear_layers)
+    num_blocks = (n + 1) // 2
+    block_indices = [
+        (2 * b, 2 * b + 1) if 2 * b + 1 < n else (2 * b, None)
+        for b in range(num_blocks)
+    ]
+    for block_idx, (layer_idx, next_idx) in enumerate(block_indices):
+        layer = linear_layers[layer_idx]
+        next_layer = linear_layers[next_idx] if next_idx is not None else None
+        if next_layer is not None and int(layer.out_features or 0) != int(next_layer.in_features or 0):
+            raise RuntimeError(
+                f"Block interface mismatch: {layer.name}.out_features={layer.out_features} "
+                f"!= {next_layer.name}.in_features={next_layer.in_features}"
+            )
+        prefix = _proj_prefix(block_idx)
+        wq, bq, wtag = mem_export_weight_matrix(layer, bit_width, scale)
+        in_f = layer.in_features or 0
+        out_f = layer.out_features or 0
+
+        if debug_mem:
+            qp = layer.quant_params or {}
+            log_mem_export_debug(
+                f"{layer.name}->{prefix}_in",
+                wq,
+                bq,
+                wtag,
+                bit_width=bit_width,
+                onnx_weight_scale=qp.get("weight_scale") if isinstance(qp, dict) else None,
+                onnx_zp=qp.get("b_zero_point") if isinstance(qp, dict) else None,
+            )
+
+        # proj_in: weights + bias (per layer block, as in the FC chain)
+        generate_quant_pkg_style_weight_mem(wq, mem_dir / f"{prefix}_in_weights.mem", "fc1", in_f, out_f, bit_width)
+        generate_proj_bias_mem_acc(bq, mem_dir / f"{prefix}_in_bias.mem", out_f, bit_width)
+
+        # proj_out: next layer weights + bias (per layer block, as in the FC chain)
+        if next_layer is not None:
+            next_wq, next_bq, ntag = mem_export_weight_matrix(next_layer, bit_width, scale)
+            next_in = next_layer.in_features or 0
+            next_out = next_layer.out_features or 0
+            if debug_mem:
+                nqp = next_layer.quant_params or {}
+                log_mem_export_debug(
+                    f"{next_layer.name}->{prefix}_out",
+                    next_wq,
+                    next_bq,
+                    ntag,
+                    bit_width=bit_width,
+                    onnx_weight_scale=nqp.get("weight_scale") if isinstance(nqp, dict) else None,
+                    onnx_zp=nqp.get("b_zero_point") if isinstance(nqp, dict) else None,
+                )
+            generate_quant_pkg_style_weight_mem(next_wq, mem_dir / f"{prefix}_out_weights.mem", "fc2", next_in, next_out, bit_width)
+            if layer.qdq_fout_exp is None:
+                raise RuntimeError(
+                    f"{layer.name}: qdq_fout_exp required for proj_out bias (paired block fin_act_exp)"
+                )
+            fin_act_exp = abs(int(layer.qdq_fout_exp))
+            next_bq_acc = proj_out_bias_rom_values(
+                next_layer,
+                bit_width,
+                fin_act_exp=fin_act_exp,
+                mem_label=f"{prefix}_out_bias.mem",
+            )
+            generate_proj_out_bias_mem(next_bq_acc, mem_dir / f"{prefix}_out_bias.mem", bit_width)
+        else:
+            next_out = 1
+            w_out = np.zeros((1, out_f), dtype=np.int32)
+            if out_f >= 1:
+                w_out[0, 0] = 1
+            generate_quant_pkg_style_weight_mem(w_out, mem_dir / f"{prefix}_out_weights.mem", "fc2", out_f, next_out, bit_width)
+            if layer.qdq_fout_exp is None:
+                raise RuntimeError(
+                    f"{layer.name}: qdq_fout_exp required for proj_out bias (tail block fin_act_exp)"
+                )
+            fin_act_exp = abs(int(layer.qdq_fout_exp))
+            bq_out_acc = proj_out_bias_rom_values(
+                layer,
+                bit_width,
+                fin_act_exp=fin_act_exp,
+                mem_label=f"{prefix}_out_bias.mem",
+            )
+            generate_proj_out_bias_mem(bq_out_acc, mem_dir / f"{prefix}_out_bias.mem", bit_width)
+
+
+def generate_quant_pkg_style_mems(
+    layer_name: str,
+    weight_matrix: np.ndarray,
+    bias_vector: np.ndarray,
+    bit_width: int,
+    rtl_root: Path,
+) -> None:
+    """Generate mem files for legacy flow."""
+    if bit_width not in (4, 8, 16):
+        raise ValueError(f"Unsupported bit width: {bit_width}. Supported: 4, 8, 16")
+
+    mem_dir = rtl_root / "mem"
+    mem_dir.mkdir(parents=True, exist_ok=True)
+
+    weight_matrix = np.asarray(weight_matrix, dtype=np.int32)
+    bias_vector = np.asarray(bias_vector, dtype=np.int32)
+
+    out_features, in_features = weight_matrix.shape
+    mask = (1 << bit_width) - 1
+
+    weights_path = mem_dir / f"{layer_name}_weights_{bit_width}.mem"
+    with weights_path.open("w", encoding="utf-8") as wf:
+        if layer_name == "fc1":
+            num_neurons = out_features
+            total_bits = num_neurons * bit_width
+            hex_width = total_bits // 4
+            for j in range(in_features):
+                packed = 0
+                for neuron_idx in range(num_neurons):
+                    val = int(weight_matrix[neuron_idx, j]) & mask
+                    packed |= val << (neuron_idx * bit_width)
+                wf.write(f"{packed:0{hex_width}X}\n")
+        else:
+            num_inputs = in_features
+            total_bits = num_inputs * bit_width
+            hex_width = total_bits // 4
+            for neuron_idx in range(out_features):
+                packed = 0
+                for inp_idx in range(num_inputs):
+                    val = int(weight_matrix[neuron_idx, inp_idx]) & mask
+                    packed |= val << (inp_idx * bit_width)
+                wf.write(f"{packed:0{hex_width}X}\n")
+
+    biases_path = mem_dir / f"{layer_name}_biases_{bit_width}.mem"
+    num_neurons = bias_vector.shape[0]
+    total_bits = num_neurons * bit_width
+    hex_width = (total_bits + 3) // 4
+    packed_biases = 0
+    for neuron_idx in range(num_neurons):
+        val = int(bias_vector[neuron_idx]) & mask
+        packed_biases |= val << (neuron_idx * bit_width)
+    with biases_path.open("w", encoding="utf-8") as bf:
+        bf.write(f"{packed_biases:0{hex_width}X}\n")
+
+
+def emit_legacy_rtl_outputs(
+    legacy_rtl_dir: Path,
+    layers: List[LayerInfo],
+    scale: int,
+    bits_list: Sequence[int] = (4, 8, 16),
+    write_sv: bool = True,
+) -> None:
+    """Emit legacy rtl/ flow outputs (mem files only; write_sv not supported)."""
+    legacy_rtl_dir = legacy_rtl_dir.resolve()
+
+    if write_sv:
+        LOGGER.warning("Legacy SV file writing not supported in minimal rtl_mapper; emitting mem files only.")
+
+    for layer in layers:
+        if layer.layer_type != "linear":
+            continue
+
+        if layer.weight is None:
+            raise RuntimeError(f"Linear layer {layer.name} missing weights")
+
+        weight_np = np.asarray(layer.weight, dtype=np.float32)
+        bias_np = (
+            np.asarray(layer.bias, dtype=np.float32)
+            if layer.bias is not None
+            else np.zeros((weight_np.shape[0],), dtype=np.float32)
+        )
+
+        for bits in bits_list:
+            wq = float_to_int(weight_np, scale, bits)
+            bq = float_to_int(bias_np, scale, bits)
+            generate_quant_pkg_style_mems(layer.name, wq, bq, bits, legacy_rtl_dir)
+
+
+# =============================================================================
+# Embedded SystemVerilog Module Templates
+#
+# The SV source for reusable building-block modules is stored as Python string
+# constants (MAC_SV, FC_IN_SV, etc.) rather than
+# external template files.  This keeps the generator self-contained — no
+# separate template directory is needed.
+#
+# Each string is written to disk by ``_write_embedded_sv`` with a PyramidTech
+# header prepended.  The quant_pkg is generated programmatically (to
+# parameterise Q_WIDTH at compile time).
+#
+# Module overview (hardware datapath, in order):
+#   quant_pkg  → widths, types, saturation constants shared by all modules
+#   mac        → pipelined multiply-accumulate (3-stage: multiply, accumulate, saturate)
+#   fc_in      → instantiates N MACs, adds bias (<<< BIAS_SCALE), shifts (>>> LAYER_SCALE)
+#   fc_out     → single-output FC with 3-stage pipeline (mult, add+scale, saturate)
+#   relu_layer → max(0, x), registered output
+#   sync_fifo  → pointer-based FIFO for AXI4-Stream back-pressure
+# =============================================================================
+
+def _get_quant_pkg_content(weight_width: int) -> str:
+    """Generate quant_pkg.sv."""
+    if weight_width not in (4, 8, 16):
+        weight_width = 16
+    body = '''package quant_pkg;
+
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  // =============================================================
+  // Quantization mode (select ONE at compile time)
+  // =============================================================
+  `ifdef Q_INT4
+    localparam int Q_WIDTH = 32'd4;
+  `elsif Q_INT8
+    localparam int Q_WIDTH = 32'd8;
+  `elsif Q_INT16
+    localparam int Q_WIDTH = 32'd16;
+  `else
+    // Default (safety)
+    localparam int Q_WIDTH = 32'd8;
+  `endif
+
+  // =============================================================
+  // Common fixed-point types
+  // =============================================================
+  typedef logic signed [Q_WIDTH-1:0]       q_data_t;   // Quantized data
+  typedef logic signed [2*Q_WIDTH-1:0]     q_mult_t;   // Multiply result
+  typedef logic signed [4*Q_WIDTH-1:0]     acc_t;      // Accumulator
+
+  //Widths of prediction axi4 stream
+  localparam int DATA_WIDTH = 32'd32;
+  localparam int KEEP_WIDTH = 32'd4;
+  
+
+  // =============================================================
+  // Method A: Narrow limits (Q-width), then cast to acc_t
+  // Use when accumulator must saturate to Q range
+  // =============================================================
+  localparam q_data_t Q_MAX = {1'b0, {Q_WIDTH-1{1'b1}}};
+  localparam q_data_t Q_MIN = {1'b1, {Q_WIDTH-1{1'b0}}};
+
+  localparam acc_t ACC_Q_MAX = acc_t'(Q_MAX);
+  localparam acc_t ACC_Q_MIN = acc_t'(Q_MIN);
+
+  // =============================================================
+  // Method B: Native accumulator limits (full acc_t width)
+  // Use when accumulator keeps full dynamic range
+  // =============================================================
+  localparam acc_t ACC_FULL_MAX = {1'b0, {4*Q_WIDTH-1{1'b1}}};
+  localparam acc_t ACC_FULL_MIN = {1'b1, {4*Q_WIDTH-1{1'b0}}};
+
+  // =============================================================
+  // Activation Function Limits
+  // =============================================================
+  localparam q_data_t SIGMOID_MAX = 1 << (Q_WIDTH - 2); 
+  localparam q_data_t SIGMOID_MIN = 8'h0;
+
+endpackage: quant_pkg
+'''
+    desc = "Package defining quantization widths, fixed-point data types,\n                and saturation limits for accumulation and activation functions."
+    return _pyramidtech_wrap(body, "quant_pkg.sv", desc, quant_pkg_style=True)
+MAC_SV = '''module mac
+  import quant_pkg::*;
+#(
+  parameter int INPUT_SIZE    = 16
+)(
+  input  logic clk_i,
+  input  logic rst_n_i,
+
+  input  logic enable_i,      // Enable MAC operation
+
+  input  q_data_t a_i,        // Signed multiplicand
+  input  q_data_t b_i,        // Signed multiplier
+
+  output acc_t acc_o,         // Saturated accumulator output
+  output logic valid_o        // Output valid (aligned with acc)
+);
+
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  // ------------------------------------------------------------
+  // Internal signals
+  // ------------------------------------------------------------
+  q_mult_t mult_q;            // Registered multiplication result (Stage 1)
+  acc_t    acc_q;             // Internal accumulator register (Stage 2)
+
+  logic    enable_q;          // Pipeline stage 1 enable
+  logic    enable_q2;         // Pipeline stage 2 enable
+
+  logic [$clog2(INPUT_SIZE + 1) - 1:0] count_q;   //Counter of input data
+  logic clear;
+  logic clear_q;             // Pipeline stage 1 clear
+  logic clear_q2;            // Pipeline stage 2 clear
+
+
+  assign clear = (count_q == INPUT_SIZE) ? 1'b1 : 1'b0;
+
+  // ------------------------------------------------------------
+  // Stage 1: Multiply
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin: multiply_stage
+    if (!rst_n_i) begin
+      mult_q  <= '0;
+      count_q <= '0;
+    end
+    else if (clear) begin
+      mult_q  <= '0;
+      count_q <= '0;
+    end
+    else if (enable_i) begin
+      mult_q  <= $signed(a_i) * $signed(b_i);
+      count_q <= count_q + 1;
+    end
+  end: multiply_stage
+
+  // ------------------------------------------------------------
+  // Stage 2: Accumulate
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin: accumulate_stage
+    if (!rst_n_i) begin
+      acc_q <= '0;
+    end
+    else if (clear_q) begin
+      acc_q <= '0;
+    end
+    else if (enable_q) begin
+      acc_q <= acc_q + mult_q;
+    end
+  end: accumulate_stage
+
+  // ------------------------------------------------------------
+  // Stage 3: Output saturation to ACC full range
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i) begin: saturation_stage
+    if (acc_q > $signed(ACC_FULL_MAX)) begin
+      acc_o <= ACC_FULL_MAX;
+    end
+    else if (acc_q < $signed(ACC_FULL_MIN)) begin
+      acc_o <= ACC_FULL_MIN;
+    end
+    else begin
+      // Truncate/slice using explicit width literals
+      acc_o <= acc_q[4*Q_WIDTH-1:0];
+    end
+  end: saturation_stage
+
+  // ------------------------------------------------------------
+  // Valid signal pipeline (matches MAC latency)
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin: valid_pipeline
+    if (!rst_n_i) begin
+      enable_q   <= 1'b0;
+      enable_q2  <= 1'b0;
+      valid_o    <= 1'b0;
+      clear_q    <= 1'b0;
+      clear_q2   <= 1'b0;
+    end
+    else if (clear_q2) begin
+      valid_o    <= 1'b0;
+      enable_q   <= enable_i;
+      enable_q2  <= enable_q;
+      clear_q2   <= 1'b0;
+    end
+    else begin
+      enable_q   <= enable_i;
+      enable_q2  <= enable_q;
+      valid_o    <= enable_q2;
+      clear_q    <= clear;
+      clear_q2   <= clear_q;
+    end
+  end: valid_pipeline
+
+endmodule: mac
+'''
+
+FC_IN_SV = '''// MAC (F_mac) + bias: bias_aligned = biases_i <<< BIAS_SCALE (see quantize_bias_for_rtl).
+module fc_in
+  import quant_pkg::*;
+#(
+  parameter int    NUM_NEURONS = 8,
+  parameter int    INPUT_SIZE  = 16,
+  parameter signed BIAS_SCALE  = 0,
+  parameter signed LAYER_SCALE = 12
+)(
+  input  logic clk_i,
+  input  logic rst_n_i,
+
+  input  logic valid_i,                  // Input data valid
+  input  q_data_t data_i,                // Input data
+  input  q_data_t weights_i[NUM_NEURONS], // Weight vector per neuron
+  input  acc_t    biases_i[NUM_NEURONS],  // Biases vector per neuron
+
+  output q_data_t data_o[NUM_NEURONS],    // FC layer output
+  output logic    valid_o                // Output valid pulse
+);
+
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  // ------------------------------------------------------------
+  // Internal signals
+  // ------------------------------------------------------------
+  acc_t mac_acc_q[NUM_NEURONS];          // Registered MAC outputs
+  acc_t acc_tmp_s[NUM_NEURONS];          // Combinational bias addition
+  acc_t bias_aligned_s[NUM_NEURONS];     // Combinational bias alignment
+  acc_t data_out_temp_s[NUM_NEURONS];    // Combinational layer scaling
+
+  logic [$clog2(INPUT_SIZE + 1) - 1:0] count_q;
+
+  logic mac_enable_s;
+  logic [NUM_NEURONS- 1:0] mac_valid_q;
+  logic all_mac_valid_s;
+
+  // ------------------------------------------------------------
+  // Instantiate MAC units
+  // ------------------------------------------------------------
+  genvar i;
+  generate
+    for (i = 0; i < NUM_NEURONS; i++) begin : gen_mac_units
+      mac #(
+          .INPUT_SIZE(INPUT_SIZE)
+      ) u_mac (
+        .clk_i     (clk_i),
+        .rst_n_i     (rst_n_i),
+        .enable_i  (mac_enable_s),
+        .a_i       (data_i),
+        .b_i       (weights_i[i]),
+        .valid_o   (mac_valid_q[i]),
+        .acc_o     (mac_acc_q[i])
+      );
+    end
+  endgenerate
+
+  assign all_mac_valid_s = &mac_valid_q;
+  assign mac_enable_s    = valid_i;
+
+  // ------------------------------------------------------------
+  // Count valid inputs and generate valid_o for last input
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : count_logic
+    if (!rst_n_i) begin
+      count_q <= '0;
+      valid_o <= 1'b0;
+    end
+    else begin
+      valid_o <= 1'b0;
+      if (all_mac_valid_s) begin
+        if (count_q == (INPUT_SIZE - 1)) begin
+          count_q <= '0;
+          valid_o <= 1'b1;
+        end
+        else begin
+          count_q <= count_q + 1'b1;
+        end
+      end
+    end
+  end : count_logic
+
+  // ------------------------------------------------------------
+  // Bias addition, layer scaling, and output saturation
+  // ------------------------------------------------------------
+  generate
+    for (i = 0; i < NUM_NEURONS; i++) begin : gen_output_path
+      // Align bias to accumulator width
+      assign bias_aligned_s[i] = (BIAS_SCALE >= 0) ?
+                                 (biases_i[i] <<< BIAS_SCALE) :
+                                 (biases_i[i] >>> -BIAS_SCALE);
+
+      // Add bias to MAC output
+      assign acc_tmp_s[i] = mac_acc_q[i] + bias_aligned_s[i];
+
+      // Apply layer scaling
+      assign data_out_temp_s[i] = (LAYER_SCALE >= 0) ?
+                                  (acc_tmp_s[i] >>> LAYER_SCALE) :
+                                  (acc_tmp_s[i] <<< -LAYER_SCALE);
+
+      // Register output with saturation logic
+      always_ff @(posedge clk_i or negedge rst_n_i) begin : saturation_reg
+        if (!rst_n_i) begin
+          data_o[i] <= '0;
+        end
+        else if (count_q == (INPUT_SIZE-1)) begin
+          if (data_out_temp_s[i] > ACC_Q_MAX) begin
+            data_o[i] <= Q_MAX;
+          end
+          else if (data_out_temp_s[i] < ACC_Q_MIN) begin
+            data_o[i] <= Q_MIN;
+          end
+          else begin
+            // Cast to narrow quantized data type
+            data_o[i] <= data_out_temp_s[i][Q_WIDTH-1:0];
+          end
+        end
+      end : saturation_reg
+    end
+  endgenerate
+
+endmodule : fc_in
+'''
+
+FC_OUT_SV = '''module fc_out 
+  import quant_pkg::*;
+#(
+  parameter int    NUM_NEURONS = 2,
+  parameter signed LAYER_SCALE = 5,
+  parameter signed BIAS_SCALE  = 1
+)(
+  input  logic clk_i,
+  input  logic rst_n_i,
+
+  input  logic    valid_i,                   // Input valid
+  input  q_data_t data_i[NUM_NEURONS],       // Inputs to this FC layer
+  input  q_data_t weights_i[NUM_NEURONS],    // Weight vector
+  input  acc_t    bias_i,                    // Bias
+
+  output q_data_t data_o,                    // FC output
+  output logic    valid_o                    // Output valid
+);
+
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  // ------------------------------------------------------------
+  // Internal signals
+  // ------------------------------------------------------------
+  acc_t mult_res_s[NUM_NEURONS];
+  acc_t bias_q;
+
+  // Pipeline Stage 1 Registers
+  acc_t mult_q[NUM_NEURONS];
+  logic valid_q;
+
+  // Stage 2 Combinational Signals
+  acc_t sum_stage2_s;
+  acc_t sum_stage2_tmp_s;
+
+  // Pipeline Stage 2 Registers
+  acc_t sum_q2;
+  logic valid_q2;
+
+  // ============================================================
+  // Stage 0/1: Multipliers and Input Registration
+  // ============================================================
+  genvar i;
+  generate
+    for (i = 0; i < NUM_NEURONS; i = i + 1) begin : gen_mult
+      assign mult_res_s[i] = $signed(data_i[i]) * $signed(weights_i[i]);
+    end
+  endgenerate
+
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : stage1_regs
+    if (!rst_n_i) begin
+      for (int j = 0; j < NUM_NEURONS; j++) begin
+        mult_q[j] <= '0;
+      end
+      valid_q <= 1'b0;
+      bias_q  <= '0;
+    end 
+    else begin
+      for (int j = 0; j < NUM_NEURONS; j++) begin
+        mult_q[j] <= mult_res_s[j];
+      end
+      valid_q <= valid_i;
+      bias_q  <= bias_i;
+    end
+  end : stage1_regs
+
+  // ============================================================
+  // Stage 2: Adder + Bias + Layer scaling
+  // ============================================================
+  always_comb begin : stage2_logic
+    if (BIAS_SCALE >= 0) begin
+      sum_stage2_tmp_s = bias_q <<< BIAS_SCALE; 
+    end
+    else begin
+      sum_stage2_tmp_s = bias_q >>> -BIAS_SCALE;
+    end
+
+    for (int j = 0; j < NUM_NEURONS; j++) begin
+      sum_stage2_tmp_s += mult_q[j];
+    end
+
+    if (LAYER_SCALE >= 0) begin
+      sum_stage2_s = sum_stage2_tmp_s >>> LAYER_SCALE;
+    end
+    else begin
+      sum_stage2_s = sum_stage2_tmp_s <<< -LAYER_SCALE;
+    end
+  end : stage2_logic
+
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : stage2_regs
+    if (!rst_n_i) begin
+      sum_q2   <= '0;
+      valid_q2 <= 1'b0;
+    end 
+    else begin
+      sum_q2   <= sum_stage2_s;
+      valid_q2 <= valid_q;
+    end
+  end : stage2_regs
+
+  // ============================================================
+  // Stage 3: Saturation + Output Register
+  // ============================================================
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : stage3_regs
+    if (!rst_n_i) begin
+      data_o  <= '0;
+      valid_o <= 1'b0;
+    end 
+    else begin
+      valid_o <= valid_q2;
+      if (sum_q2 > ACC_Q_MAX) begin
+        data_o <= Q_MAX;
+      end
+      else if (sum_q2 < ACC_Q_MIN) begin
+        data_o <= Q_MIN;
+      end
+      else begin
+        data_o <= sum_q2[Q_WIDTH- 1:0];
+      end
+    end
+  end : stage3_regs
+
+endmodule : fc_out
+'''
+
+RELU_LAYER_SV = '''module relu_layer 
+  import quant_pkg::*;
+(
+  input  logic    clk_i,
+  input  logic    rst_n_i,
+
+  input  logic    valid_i,               // Input data valid
+  input  q_data_t data_i,                // Input quantized data
+
+  output q_data_t data_o,                // ReLU activated output
+  output logic    valid_o                // Output valid signal
+);
+
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  // ============================================================
+  // ReLU logic with pipelined valid signal
+  // ============================================================
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : relu_pipeline
+    if (!rst_n_i) begin
+      data_o  <= '0;
+      valid_o <= 1'b0;
+    end 
+    else begin
+      valid_o <= valid_i;
+      if (valid_i) begin
+        // Rectified Linear Unit logic: output = max(0, input)
+        data_o <= (data_i < 0) ? 0 : data_i;
+      end
+    end
+  end : relu_pipeline
+
+endmodule : relu_layer
+'''
+
+SYNC_FIFO_SV = '''module sync_fifo #(
+  parameter int DATA_WIDTH = 32,
+  parameter int DEPTH      = 1024
+)(
+  input  logic clk_i,
+  input  logic rst_n_i,
+
+  input  logic                  write_en_i,
+  input  logic [DATA_WIDTH-1:0] write_data_i,
+  output logic                  full_o,
+
+  input  logic                  read_en_i,
+  output logic [DATA_WIDTH-1:0] read_data_o,
+  output logic                  empty_o
+);
+
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  localparam int ADDR_WIDTH = $clog2(DEPTH);
+
+  logic [DATA_WIDTH-1:0] fifo_mem_q [0:DEPTH-1];
+  logic [ADDR_WIDTH:0] write_ptr_q;
+  logic [ADDR_WIDTH:0] read_ptr_q;
+
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : write_ptr_logic
+    if (!rst_n_i) begin
+      write_ptr_q <= '0;
+    end
+    else if (write_en_i && !full_o) begin
+      write_ptr_q <= write_ptr_q + 1'b1;
+    end
+  end : write_ptr_logic
+
+  always_ff @(posedge clk_i) begin : write_mem_logic
+    if (write_en_i && !full_o) begin
+      fifo_mem_q[write_ptr_q[ADDR_WIDTH-1:0]] <= write_data_i;
+    end
+  end : write_mem_logic
+
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : read_logic
+    if (!rst_n_i) begin
+      read_ptr_q <= '0;
+      read_data_o <= '0;
+    end
+    else if (read_en_i && !empty_o) begin
+      read_data_o <= fifo_mem_q[read_ptr_q[ADDR_WIDTH-1:0]];
+      read_ptr_q <= read_ptr_q + 1'b1;
+    end
+  end : read_logic
+
+  assign empty_o = (write_ptr_q == read_ptr_q);
+  assign full_o  = (write_ptr_q[ADDR_WIDTH] != read_ptr_q[ADDR_WIDTH]) &&
+                   (write_ptr_q[ADDR_WIDTH-1:0] == read_ptr_q[ADDR_WIDTH-1:0]);
+
+endmodule : sync_fifo
+'''
+
+def _linear_layers_have_onnx_pair_qf_tensors(linear_layers: List[LayerInfo]) -> bool:
+    if not linear_layers:
+        return False
+    for layer in linear_layers:
+        if (
+            layer.onnx_pair_float_weight is None
+            or layer.onnx_pair_quant_weight is None
+            or layer.onnx_pair_float_bias is None
+            or layer.onnx_pair_quant_bias is None
+        ):
+            return False
+    return True
+
+
+def _layer_has_full_onnx_pair(layer: LayerInfo) -> bool:
+    return (
+        layer.onnx_pair_float_weight is not None
+        and layer.onnx_pair_quant_weight is not None
+        and layer.onnx_pair_float_bias is not None
+        and layer.onnx_pair_quant_bias is not None
+    )
+
+
+def _fw_fb_pair_exponents_from_onnx_pair(layer: LayerInfo, fin_qdq: int) -> Tuple[int, int]:
+    """Fw/Fb exponents for ``_qdq_pair_alignment`` / ``FC_*_*_BIAS_SCALE`` — same as ``_build_qdq_pair_interlayer_rows``."""
+    fw = _fw_exponent_from_onnx(layer.onnx_pair_quant_weight, layer.onnx_pair_float_weight)
+    Bf = np.asarray(layer.onnx_pair_float_bias, dtype=np.float64).ravel()
+    ws_eff: Optional[np.ndarray]
+    if layer.onnx_pair_weight_scale_arr is not None:
+        ws_eff = np.asarray(layer.onnx_pair_weight_scale_arr, dtype=np.float64).reshape(-1)
+    elif layer.onnx_pair_weight_scale is not None:
+        ws_eff = np.asarray([float(layer.onnx_pair_weight_scale)], dtype=np.float64)
+    else:
+        ws_eff = None
+    bq = np.asarray(layer.onnx_pair_quant_bias, dtype=np.float64).ravel()
+    fb = _fb_exponent_from_onnx(Bf, bq, fin_qdq, fw, w_scale=ws_eff)
+    return fw, fb
+
+
+def _align_quant_float_weights(qw: np.ndarray, fw: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    qw = np.asarray(qw)
+    fw = np.asarray(fw)
+    if qw.shape == fw.shape:
+        return qw, fw
+    if qw.shape == (fw.shape[1], fw.shape[0]):
+        return np.ascontiguousarray(qw.T), fw
+    if fw.shape == (qw.shape[1], qw.shape[0]):
+        return qw, np.ascontiguousarray(fw.T)
+    raise ValueError(f"Weight shape mismatch for Fw extraction: quant {qw.shape} vs float {fw.shape}")
+
+
+def _mode_round_log2_ratio(q: np.ndarray, f: np.ndarray) -> Optional[int]:
+    """Find the dominant power-of-two ratio between quantized and float arrays.
+
+    For each element where both q and f are non-zero, compute round(log2(|q|/|f|))
+    and return the statistical mode.  This gives the exponent F such that
+    q ≈ f * 2^F for the majority of elements — i.e. the quantization gain.
+    """
+    q = np.asarray(q, dtype=np.float64).ravel()
+    f = np.asarray(f, dtype=np.float64).ravel()
+    if q.size != f.size:
+        return None
+    m = (f != 0) & (q != 0)
+    if not np.any(m):
+        return None
+    s = np.abs(q[m]) / np.abs(f[m])
+    r = np.rint(np.log2(s)).astype(np.int64)
+    uniq, counts = np.unique(r, return_counts=True)
+    return int(uniq[int(np.argmax(counts))])
+
+
+def _fw_exponent_from_onnx(qw: np.ndarray, fw: np.ndarray) -> int:
+    """Weight exponent from quant vs float ONNX tensors (mode of round(log2(|q|/|f|)))."""
+    qw, fw = _align_quant_float_weights(qw, fw)
+    m = _mode_round_log2_ratio(qw, fw)
+    return 0 if m is None else m
+
+
+def _fb_exponent_from_onnx(
+    fb: np.ndarray,
+    bq: np.ndarray,
+    fin: int,
+    fw: int,
+    *,
+    w_scale: Optional[np.ndarray],
+) -> int:
+    fb = np.asarray(fb, dtype=np.float64).ravel()
+    bq = np.asarray(bq, dtype=np.float64).ravel()
+    m_pair = _mode_round_log2_ratio(bq, fb)
+    if m_pair is not None:
+        return int(m_pair)
+    ws = None if w_scale is None else np.asarray(w_scale, dtype=np.float64).reshape(-1)
+    if ws is None or ws.size == 0:
+        return fin + fw
+    ws = ws[np.isfinite(ws) & (ws > 0)]
+    if ws.size == 0:
+        return fin + fw
+    if ws.size == 1:
+        ws_mode = float(ws[0])
+    else:
+        l2 = np.rint(np.log2(ws)).astype(np.int64)
+        uniq, counts = np.unique(l2, return_counts=True)
+        ws_mode = float(2.0 ** int(uniq[int(np.argmax(counts))]))
+    s_act = 2.0 ** (-fin)
+    s_mac = s_act * ws_mode
+    b_int = np.rint(fb / s_mac).astype(np.float64)
+    if not np.any(fb != 0) and not np.any(b_int != 0):
+        return fin + fw
+    if np.all(np.abs(b_int) < 1e-12) and np.any(fb != 0):
+        return fin + fw
+    m = _mode_round_log2_ratio(b_int, fb)
+    if m is None:
+        return fin + fw
+    return m
+
+
+def _qdq_pair_bias_alignment(fin: int, fw: int, fb: int) -> Tuple[int, str]:
+    """BIAS_SCALE row: compare F_mac = Fin+Fw with Fb."""
+    fmac = fin + fw
+    if fmac > fb:
+        return fmac - fb, "Left"
+    if fmac < fb:
+        return fb - fmac, "Right"
+    return 0, "NA"
+
+
+def _qdq_pair_layer_alignment(fin: int, fw: int, fout: int) -> Tuple[int, str]:
+    """LAYER_SCALE row: F_mac = Fin+Fw vs Fout. Use Fw from ``quantize_weight_for_rtl`` (ROM weight plane)."""
+    fmac = fin + fw
+    if fmac > fout:
+        return fmac - fout, "Right"
+    if fmac < fout:
+        return fout - fmac, "Left"
+    return 0, "NA"
+
+
+def _qdq_pair_alignment(
+    fin: int, fw: int, fb: int, fout: int
+) -> Tuple[int, str, int, str]:
+    """Single Fw for both rows (legacy / interlayer rows where ONNX Fw drives everything)."""
+    bs, bd = _qdq_pair_bias_alignment(fin, fw, fb)
+    ls, ld = _qdq_pair_layer_alignment(fin, fw, fout)
+    return bs, bd, ls, ld
+
+
+def _rtl_signed_bias_scale(bias_scale: int, bias_dir: str) -> int:
+    if bias_dir == "NA" or bias_scale == 0:
+        return 0
+    if bias_dir == "Left":
+        return bias_scale
+    if bias_dir == "Right":
+        return -bias_scale
+    return 0
+
+
+def _rtl_signed_layer_scale(layer_scale: int, layer_dir: str) -> int:
+    if layer_dir == "NA" or layer_scale == 0:
+        return 0
+    if layer_dir == "Right":
+        return layer_scale
+    if layer_dir == "Left":
+        return -layer_scale
+    return 0
+
+
+def _build_qdq_pair_interlayer_rows(
+    linear_layers: List[LayerInfo],
+) -> List[Dict[str, Any]]:
+    """Build per-layer alignment rows using ONNX-pair Fw/Fb and QDQ Fin/Fout.
+
+    Each row contains the four exponents (Fin, Fw, Fb, Fout) plus the derived
+    BIAS_SCALE and LAYER_SCALE shift values.  Used by the legacy
+    ``compute_fc_layer_scales`` path.
+    """
+    rows: List[Dict[str, Any]] = []
+    for i, layer in enumerate(linear_layers):
+        if layer.qdq_fin_exp is None or layer.qdq_fout_exp is None:
+            raise RuntimeError(
+                f"{layer.name}: missing qdq_fin_exp / qdq_fout_exp for inter-layer scale rows."
+            )
+        fin = abs(int(layer.qdq_fin_exp))
+        fout = abs(int(layer.qdq_fout_exp))
+        assert layer.onnx_pair_quant_weight is not None and layer.onnx_pair_float_weight is not None
+        assert layer.onnx_pair_float_bias is not None
+        fw = _fw_exponent_from_onnx(layer.onnx_pair_quant_weight, layer.onnx_pair_float_weight)
+        if layer.onnx_pair_weight_scale_arr is not None:
+            w_scale_arr = np.asarray(layer.onnx_pair_weight_scale_arr, dtype=np.float64).reshape(-1)
+        elif layer.onnx_pair_weight_scale is not None:
+            w_scale_arr = np.asarray([float(layer.onnx_pair_weight_scale)], dtype=np.float64)
+        else:
+            w_scale_arr = None
+        fb_exp = _fb_exponent_from_onnx(
+            layer.onnx_pair_float_bias,
+            layer.onnx_pair_quant_bias,
+            fin,
+            fw,
+            w_scale=w_scale_arr,
+        )
+        bsc, bdir, lsc, ldir = _qdq_pair_alignment(fin, fw, fb_exp, fout)
+        rows.append(
+            {
+                "Fin": fin,
+                "Fw": fw,
+                "Fb": fb_exp,
+                "Fout": fout,
+                "biasScale": bsc,
+                "biasDir": bdir,
+                "layerScale": lsc,
+                "layerDir": ldir,
+            }
+        )
+    return rows
+
+
+def compute_fc_layer_scales(
+    linear_layers: List[LayerInfo],
+    weight_width: int,
+    python_scale: int = 256,
+) -> Dict[str, int]:
+    """Compute LAYER_SCALE and BIAS_SCALE per FC block.
+
+    Fw and Fb exponents: only from ONNX pair (_fw_exponent_from_onnx / _fb_exponent_from_onnx).
+    Fin/Fout: ``LayerInfo.qdq_fin_exp`` / ``qdq_fout_exp`` from quantized ONNX QDQ scales.
+
+    ``python_scale`` is unused (API compatibility).
+
+    Requires ``attach_inter_layer_scale_tensors_from_onnx_pair``.
+    """
+    del weight_width  # unused; kept for call-site compatibility
+    del python_scale
+    if not _linear_layers_have_onnx_pair_qf_tensors(linear_layers):
+        raise RuntimeError(
+            "Inter-layer scales require both ONNX models: set onnx_pair_float_weight/bias and "
+            "onnx_pair_quant_weight/bias on each linear layer (quantized + float ONNX pair)."
+        )
+    rows = _build_qdq_pair_interlayer_rows(linear_layers)
+    n = len(linear_layers)
+    num_blocks = (n + 1) // 2
+    result: Dict[str, int] = {}
+    for b in range(num_blocks):
+        in_idx = 2 * b
+        out_idx = 2 * b + 1 if 2 * b + 1 < n else None
+        rin = rows[in_idx]
+        rout = rows[out_idx] if out_idx is not None else rin
+        prefix = f"FC_{b + 1}"
+        result[f"{prefix}_IN_LAYER_SCALE"] = _rtl_signed_layer_scale(rin["layerScale"], rin["layerDir"])
+        result[f"{prefix}_IN_BIAS_SCALE"] = _rtl_signed_bias_scale(rin["biasScale"], rin["biasDir"])
+        result[f"{prefix}_OUT_LAYER_SCALE"] = _rtl_signed_layer_scale(rout["layerScale"], rout["layerDir"])
+        result[f"{prefix}_OUT_BIAS_SCALE"] = _rtl_signed_bias_scale(rout["biasScale"], rout["biasDir"])
+
+    for k in list(result.keys()):
+        raw_v = int(result[k])
+        if raw_v < -24 or raw_v > 24:
+            raise RuntimeError(f"Scale parameter {k} out of supported range [-24,24]: {raw_v}")
+        result[k] = raw_v
+
+    return result
+
+
+# =============================================================================
+# FC Chain Parameter Computation
+#
+# FC layers are grouped into "blocks" of two consecutive layers:
+#   Block b = (fc_{2b+1}, fc_{2b+2})  →  fc_in_layer + fc_out_layer
+# If the total number of FC layers N is odd, the last block pairs the final
+# layer with a 1x1 identity projection so every block still has an in + out half.
+#
+# Per-block parameters (FC_b_NEURONS, FC_b_INPUT_SIZE, FC_b_ROM_DEPTH,
+# FC_b_IN/OUT_LAYER_SCALE, FC_b_IN/OUT_BIAS_SCALE) are computed from ONNX
+# layer shapes and the scale engine for substitution into the SV templates.
+# =============================================================================
+
+def _compute_fc_chain_params(linear_layers: List[LayerInfo], weight_width: int = 8, python_scale: int = 256) -> dict:
+    """Compute FC chain parameters from ONNX layers.
+    Pairs layers consecutively: block b = (fc_{2b+1}, fc_{2b+2}); odd N: last block has (fcN, 1x1).
+    Returns dict with FC_1_*, FC_2_*, ... for num_blocks = ceil(N/2)."""
+    n = len(linear_layers)
+    num_blocks = (n + 1) // 2
+    scales, _scale_tag = _fc_layer_scales_unified_or_legacy(
+        linear_layers, weight_width, python_scale
+    )
+    result: Dict[str, Any] = {"FIFO_DEPTH": 1024}
+    for b in range(num_blocks):
+        in_idx = 2 * b
+        out_idx = 2 * b + 1 if 2 * b + 1 < n else None
+        in_layer = linear_layers[in_idx]
+        out_layer = linear_layers[out_idx] if out_idx is not None else None
+        in_f = in_layer.in_features or 0
+        in_out = in_layer.out_features or 0
+        rom_depth = (out_layer.out_features or 1) if out_layer else 1
+        prefix = f"FC_{b + 1}"
+        result[f"{prefix}_NEURONS"] = in_out
+        result[f"{prefix}_INPUT_SIZE"] = in_f
+        result[f"{prefix}_ROM_DEPTH"] = rom_depth
+        result[f"{prefix}_IN_LAYER_SCALE"] = scales[f"{prefix}_IN_LAYER_SCALE"]
+        result[f"{prefix}_IN_BIAS_SCALE"] = scales[f"{prefix}_IN_BIAS_SCALE"]
+        result[f"{prefix}_OUT_LAYER_SCALE"] = scales[f"{prefix}_OUT_LAYER_SCALE"]
+        result[f"{prefix}_OUT_BIAS_SCALE"] = scales[f"{prefix}_OUT_BIAS_SCALE"]
+    return result
+
+
+def _generate_fc_rom(
+    out_dir: Path,
+    rom_name: str,
+    depth: int,
+    width_neurons: int,
+    weight_width: int,
+) -> None:
+    """Generate one ROM .sv module that loads its data from a .mem file via $readmemh.
+
+    Each ROM is a simple synchronous read-port wrapper around a memory array.
+    The WIDTH parameter is set to the packed bit-width of one ROM row (all
+    neurons * Q_WIDTH for weights, or acc_t for biases).  DEPTH is the number
+    of addresses (= input features for proj_in weights, or output neurons for
+    proj_out weights).
+    """
+    base = rom_name.replace("_weights_rom", "").replace("_bias_rom", "")
+    if "bias" in rom_name:
+        mem_basename = f"{base}_bias.mem"
+    else:
+        mem_basename = f"{base}_weights.mem"
+    packed_width = width_neurons * weight_width
+    if "bias" in rom_name and "in" in rom_name:
+        packed_width = width_neurons * weight_width * 4  # acc_t per neuron for fc_in bias
+    elif "bias" in rom_name and "out" in rom_name:
+        packed_width = weight_width * 4  # acc_t for fc_out bias
+    body = f"""module {rom_name} #(
+  parameter int DEPTH  = {depth},
+  parameter int WIDTH  = {packed_width},
+  parameter int ADDR_W = (DEPTH > 1) ? $clog2(DEPTH) : 1
+) (
+  input  logic              clk_i,
+  input  logic [ADDR_W-1:0] addr_i,
+  output logic [WIDTH-1:0]  data_o
+);
+
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  (* rom_style = "block" *)
+  logic [WIDTH-1:0] mem [0:DEPTH-1];
+
+  initial begin
+    $readmemh({{`__FILE__, "/../mem_files/{mem_basename}"}}, mem);
+  end
+
+  always_ff @(posedge clk_i) begin : read_port
+    data_o <= mem[addr_i];
+  end : read_port
+
+endmodule : {rom_name}
+"""
+    rom_type = "biases" if "bias" in rom_name else "weights"
+    rom_desc = f"rom of {rom_type} of {base} layer"
+    (out_dir / f"{rom_name}.sv").write_text(_pyramidtech_wrap(body, f"{rom_name}.sv", rom_desc), encoding="utf-8")
+
+
+def _generate_fc_in_layer_module(out_dir: Path, input_sizes: List[int], weight_width: int) -> None:
+    """Generate fc_in_layer.sv — the ROM + compute wrapper for the first half of each block.
+
+    Uses Verilog generate-if blocks keyed on ``INPUT_SIZE`` to instantiate the
+    correct weight and bias ROMs for each block.  A single fc_in_layer module
+    serves all blocks; the top module passes different INPUT_SIZE values to
+    select the matching ROM at elaboration time.
+    """
+    branches = []
+    for b, in_sz in enumerate(input_sizes):
+        prefix = _proj_prefix(b)
+        cond = "if" if b == 0 else "else if"
+        branches.append(f"""    {cond} (INPUT_SIZE == {in_sz}) begin : gen_rom_{in_sz}
+      {prefix}_in_weights_rom #(
+        .DEPTH(INPUT_SIZE),
+        .WIDTH(NUM_NEURONS * Q_WIDTH)
+      ) u_weights_rom (
+        .clk_i  (clk_i),
+        .addr_i (weight_addr_q),
+        .data_o (weight_rom_row_s)
+      );
+
+      {prefix}_in_bias_rom #(
+        .DEPTH(1),
+        .WIDTH(NUM_NEURONS * Q_WIDTH * 4)
+      ) u_bias_rom (
+        .clk_i  (clk_i),
+        .addr_i (1'b0),
+        .data_o (bias_rom_row_s)
+      );
+    end""")
+    gen_block = " \n".join(branches)
+    body = f"""`begin_keywords "1800-2012"
+module fc_in_layer 
+  import quant_pkg::*;
+#(
+  parameter int    NUM_NEURONS = 8,
+  parameter int    INPUT_SIZE  = 16,
+  parameter signed LAYER_SCALE = 12,
+  parameter signed BIAS_SCALE  = 0
+)(
+  input  logic clk_i,
+  input  logic rst_n_i,
+
+  input  logic    valid_i,               // Input valid signal
+  input  q_data_t data_i,                // Input data
+
+  output q_data_t data_o[NUM_NEURONS],   // FC layer output
+  output logic    valid_o                // Output valid pulse
+);
+
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  // ------------------------------------------------------------
+  // Internal signals and registers
+  // ------------------------------------------------------------
+  logic [$clog2(INPUT_SIZE)- 1:0] weight_addr_q;
+
+  logic [NUM_NEURONS * Q_WIDTH - 1:0]   weight_rom_row_s;
+  logic [NUM_NEURONS * Q_WIDTH*4 - 1:0] bias_rom_row_s;
+
+  q_data_t weights_rom_data_s[NUM_NEURONS];
+  acc_t    bias_rom_data_s[NUM_NEURONS];
+
+  logic    valid_i_q;
+  q_data_t data_i_q;
+
+  // ------------------------------------------------------------
+  // Input stage registers
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : input_regs
+    if (!rst_n_i) begin
+      valid_i_q <= 1'b0;
+      data_i_q  <= '0;
+    end 
+    else begin
+      valid_i_q <= valid_i;
+      data_i_q  <= data_i;
+    end
+  end : input_regs
+
+  // ------------------------------------------------------------
+  // Address counter for sequential ROM access
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : addr_counter
+    if (!rst_n_i) begin
+      weight_addr_q <= '0;
+    end
+    else if (valid_i) begin
+      weight_addr_q <= (weight_addr_q == (INPUT_SIZE - 1)) ? 
+                       '0 : weight_addr_q + 1'b1;
+    end
+  end : addr_counter
+
+  // ------------------------------------------------------------
+  // Weight and Bias ROM Instantiations
+  // ------------------------------------------------------------
+  generate
+{gen_block}
+  endgenerate
+
+  // ------------------------------------------------------------
+  // ROM data unpacking
+  // ------------------------------------------------------------
+  genvar n;
+  generate
+    for (n = 0; n < NUM_NEURONS; n++) begin : gen_unpack
+      assign weights_rom_data_s[n] = weight_rom_row_s[n * Q_WIDTH +: Q_WIDTH];
+      assign bias_rom_data_s[n]    = bias_rom_row_s[n * Q_WIDTH * 4 +: Q_WIDTH * 4];
+    end
+  endgenerate
+
+  // ------------------------------------------------------------
+  // FC Compute Block Instance
+  // ------------------------------------------------------------
+  fc_in #(
+    .NUM_NEURONS  (NUM_NEURONS),
+    .INPUT_SIZE   (INPUT_SIZE),
+    .LAYER_SCALE  (LAYER_SCALE),
+    .BIAS_SCALE   (BIAS_SCALE)
+  ) u_fc_in (
+    .clk_i     (clk_i),
+    .rst_n_i     (rst_n_i),
+    .valid_i   (valid_i_q),
+    .data_i    (data_i_q),
+    .weights_i (weights_rom_data_s),
+    .biases_i  (bias_rom_data_s),
+    .data_o    (data_o),
+    .valid_o   (valid_o)
+  );
+
+endmodule : fc_in_layer
+`end_keywords"""
+    desc = "Fully-connected (FC) input layer with sequential ROM access.\n                Reads weights and biases from ROM and feeds the compute block."
+    (out_dir / "fc_in_layer.sv").write_text(_pyramidtech_wrap(body, "fc_in_layer.sv", desc), encoding="utf-8")
+
+
+def _generate_fc_out_layer_module(out_dir: Path, rom_depths: List[int], weight_width: int) -> None:
+    """Generate fc_out_layer.sv — the ROM + compute wrapper for the second half of each block.
+
+    Uses Verilog generate-if blocks keyed on ``ROM_DEPTH`` to instantiate the
+    correct weight and bias ROMs.  The fc_out compute block processes one
+    output neuron at a time (sequential ROM reads), unlike fc_in which feeds
+    all neurons in parallel.
+    """
+    branches = []
+    for b, rom_d in enumerate(rom_depths):
+        prefix = _proj_prefix(b)
+        cond = "if" if b == 0 else "else if"
+        addr_arg = "1'b0" if rom_d <= 1 else "weights_rom_addr_s"
+        bias_addr = "1'b0" if rom_d <= 1 else "bias_rom_addr_s"
+        branches.append(f"""    {cond} (ROM_DEPTH == {rom_d}) begin : gen_rom_{rom_d}
+      {prefix}_out_weights_rom #(
+        .DEPTH(ROM_DEPTH),
+        .WIDTH(NUM_NEURONS * Q_WIDTH)
+      ) u_weights_rom (
+        .clk_i  (clk_i),
+        .addr_i ({addr_arg}),
+        .data_o (weights_rom_data_raw_s)
+      );
+
+      {prefix}_out_bias_rom #(
+        .DEPTH(ROM_DEPTH),
+        .WIDTH(Q_WIDTH*4)
+      ) u_bias_rom (
+        .clk_i  (clk_i),
+        .addr_i ({bias_addr}),
+        .data_o (bias_rom_data_s)
+      );
+    end""")
+    gen_block = " \n".join(branches)
+    body = f"""`begin_keywords "1800-2012"
+module fc_out_layer 
+  import quant_pkg::*;
+#(
+  parameter int    NUM_NEURONS = 2,
+  parameter int    ROM_DEPTH   = 45,
+  parameter signed LAYER_SCALE = 5,
+  parameter signed BIAS_SCALE  = 1
+)(
+  input  logic clk_i,
+  input  logic rst_n_i,
+
+  input  logic    valid_i,                   // Input valid
+  input  q_data_t data_i[NUM_NEURONS],       // FC inputs
+
+  output q_data_t data_o,                    // FC output
+  output logic    valid_o                    // Output valid
+);
+
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  // ------------------------------------------------------------
+  // Counters and flags
+  // ------------------------------------------------------------
+  logic [$clog2(ROM_DEPTH) - 1:0] addr_cnt_q;
+  logic addr_last_s;
+
+  // Valid pipeline signals
+  logic valid_pipeline_q;
+  logic valid_pipeline_q2;
+  logic valid_out_engine_s;
+  logic valid_out_engine_q;
+
+  // ROM addresses
+  logic [$clog2(ROM_DEPTH) - 1:0] weights_rom_addr_s;
+  logic [$clog2(ROM_DEPTH) - 1:0] bias_rom_addr_s;
+
+  // ------------------------------------------------------------
+  // ROM data
+  // ------------------------------------------------------------
+  logic [NUM_NEURONS * Q_WIDTH - 1:0] weights_rom_data_raw_s;
+  q_data_t weights_rom_data_s[NUM_NEURONS];
+  acc_t    bias_rom_data_s;
+
+  // Registered versions (pipeline suffixes)
+  q_data_t weights_rom_data_q[NUM_NEURONS];
+  acc_t    bias_rom_data_q;
+  q_data_t data_i_q[NUM_NEURONS];
+
+  // ------------------------------------------------------------
+  // Address counter
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : addr_counter
+    if (!rst_n_i) begin
+      addr_cnt_q <= '0;
+    end
+    else if (valid_pipeline_q) begin
+      addr_cnt_q <= (addr_cnt_q == (ROM_DEPTH - 1)) ? 
+                    '0 : addr_cnt_q + 1'b1;
+    end
+  end : addr_counter
+
+  assign addr_last_s = (addr_cnt_q == (ROM_DEPTH - 1));
+
+  // ------------------------------------------------------------
+  // Valid pipeline
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : pipeline_control
+    if (!rst_n_i) begin
+      valid_pipeline_q <= 1'b0;
+    end
+    else if (valid_i) begin
+      valid_pipeline_q <= 1'b1;
+    end
+    else if (addr_last_s) begin
+      valid_pipeline_q <= 1'b0;
+    end
+  end : pipeline_control
+
+  // Extra stage to align with ROM pipeline
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : alignment_regs
+    if (!rst_n_i) begin
+      valid_pipeline_q2  <= 1'b0;
+      valid_out_engine_q <= 1'b0;
+    end
+    else begin
+      valid_pipeline_q2  <= valid_pipeline_q;
+      valid_out_engine_q <= valid_out_engine_s;
+    end
+  end : alignment_regs
+
+  assign valid_o           = valid_out_engine_q;
+  assign weights_rom_addr_s = addr_cnt_q;
+  assign bias_rom_addr_s    = addr_cnt_q;
+
+  // ------------------------------------------------------------
+  // Weight and Bias ROM Instantiations
+  // ------------------------------------------------------------
+  generate
+{gen_block}
+  endgenerate
+
+  // Split packed weights
+  genvar i;
+  generate
+    for (i = 0; i < NUM_NEURONS; i++) begin : gen_split_weights
+      assign weights_rom_data_s[i] = weights_rom_data_raw_s[i * Q_WIDTH +: Q_WIDTH];
+    end
+  endgenerate
+
+  // ------------------------------------------------------------
+  // Register ROM outputs and data_i
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : rom_out_regs
+    if (!rst_n_i) begin
+      for (int k = 0; k < NUM_NEURONS; k++) begin
+        weights_rom_data_q[k] <= '0;
+        data_i_q[k]           <= '0;
+      end
+      bias_rom_data_q <= '0;
+    end 
+    else begin
+      for (int k = 0; k < NUM_NEURONS; k++) begin
+        weights_rom_data_q[k] <= weights_rom_data_s[k];
+        data_i_q[k]           <= data_i[k];
+      end
+      bias_rom_data_q <= bias_rom_data_s;
+    end
+  end : rom_out_regs
+
+  // ------------------------------------------------------------
+  // FC Compute Block Instance
+  // ------------------------------------------------------------
+  fc_out #(
+    .NUM_NEURONS  (NUM_NEURONS),
+    .LAYER_SCALE  (LAYER_SCALE),
+    .BIAS_SCALE   (BIAS_SCALE)
+  ) u_fc_out (
+    .clk_i     (clk_i),
+    .rst_n_i     (rst_n_i),
+    .valid_i   (valid_pipeline_q2),
+    .data_i    (data_i_q),
+    .weights_i (weights_rom_data_q),
+    .bias_i    (bias_rom_data_q),
+    .data_o    (data_o),
+    .valid_o   (valid_out_engine_s)
+  );
+
+endmodule : fc_out_layer
+`end_keywords"""
+    desc = "Fully-connected output layer with sequential ROM access. \n                Reads weights and biases from ROM and feeds the fc_out compute block."
+    (out_dir / "fc_out_layer.sv").write_text(_pyramidtech_wrap(body, "fc_out_layer.sv", desc, author="AA"), encoding="utf-8")
+
+
 
 
 # =============================================================================
@@ -166,7 +2385,7 @@ class ConvLayerInfo:
 # Conv weights are 4D ``(out_ch, in_ch, kH, kW)`` while ``quantize_weight_for_rtl``
 # treats them as a single tensor for choosing Fw — i.e. one Fw exponent per layer
 # applied uniformly across all weights.  This is the same power-of-two convention
-# used for FC weights and matches the binary script.
+# used for FC weights.
 # =============================================================================
 
 def quantize_conv_weight_for_rtl(
@@ -193,7 +2412,7 @@ def build_rtl_conv_quant_descriptors(
     log_summary: bool = True,
 ) -> List[RtlLayerQuantDescriptor]:
     """Build per-conv-layer RTL quant descriptors using the same Fin/Fw/Fb/Fout
-    methodology as ``build_rtl_layer_quant_descriptors`` (binary FC path).
+    methodology as ``build_rtl_layer_quant_descriptors``.
 
     For Conv layers we don't have an ONNX-pair quant_weight tensor (Conv weights
     pass through DequantizeLinear in static QDQ but we use the float weight as the
@@ -1391,7 +3610,7 @@ def _build_multiclass_nn_sv_content(
     p_lines.append(f"  parameter int POOL_CHANNELS  = {_sv_int_lit(pool_channels)},")
     p_lines.append(f"  parameter int POOL_OUT_ROWS  = {_sv_int_lit(pool_out_rows)},")
     p_lines.append(f"  parameter int FLATTEN_SIZE   = {_sv_int_lit(flatten_size)},")
-    # FC block parameters (mirror binary script's _compute_binaryclass_nn_params)
+    # FC block parameters
     for b in range(1, num_fc_blocks + 1):
         p = f"FC_{b}"
         p_lines.append(f"  parameter int {p}_NEURONS         = {_sv_int_lit(fc_params.get(f'{p}_NEURONS', 1))},")
@@ -1804,7 +4023,7 @@ def generate_multiclass_NN_top(
     scale: int = 256,
 ) -> Path:
     """Emit ``multiclass_NN.sv`` (top module) into ``out_dir``."""
-    fc_params = _compute_binaryclass_nn_params(fc_linear_layers, weight_width, scale)
+    fc_params = _compute_fc_chain_params(fc_linear_layers, weight_width, scale)
     body = _build_multiclass_nn_sv_content(
         conv_layers,
         fc_linear_layers,
@@ -1881,14 +4100,14 @@ endmodule : multiclass_NN_wrapper
 # =============================================================================
 # Master orchestrator: emit_multiclass_format
 #
-# Sequenced steps (mirrors emit_binaryclass_nn_format):
+# Sequenced steps:
 #   1. Write reusable building blocks (quant_pkg, mac, fc_in/out, fc_in/out_layer,
 #      relu_layer, sync_fifo).
 #   2. Write multiclass-specific shells (line_buffers, dw/pw engines, avg_pool,
 #      flatten_unit, softmax/argmax).
 #   3. Generate per-conv-layer ROM .sv files + .mem files.
-#   4. Generate FC chain mem files via the binary script's generate_proj_mem_files.
-#   5. Generate FC ROM .sv via _generate_binaryclass_nn_rom + fc_in_layer / fc_out_layer.
+#   4. Generate FC chain mem files via generate_proj_mem_files.
+#   5. Generate FC ROM .sv via _generate_fc_rom + fc_in_layer / fc_out_layer.
 #   6. Generate the top module (multiclass_NN.sv) and wrapper.
 #   7. Write rtl_filelist.f in dependency order.
 # =============================================================================
@@ -1920,13 +4139,13 @@ def emit_multiclass_format(
     mem_dir = out_dir / "mem_files"
     mem_dir.mkdir(parents=True, exist_ok=True)
 
-    # ----- Step 1: Reusable building blocks (from binary script) -----
+    # ----- Step 1: Shared FC infrastructure -----
     (out_dir / "quant_pkg.sv").write_text(_get_quant_pkg_content(weight_width), encoding="utf-8")
-    _write_embedded_sv(out_dir, "mac.sv", BINARYCLASS_MAC_SV)
-    _write_embedded_sv(out_dir, "fc_in.sv", BINARYCLASS_FC_IN_SV)
-    _write_embedded_sv(out_dir, "fc_out.sv", BINARYCLASS_FC_OUT_SV)
-    _write_embedded_sv(out_dir, "relu_layer.sv", BINARYCLASS_RELU_LAYER_SV)
-    _write_embedded_sv(out_dir, "sync_fifo.sv", BINARYCLASS_SYNC_FIFO_SV)
+    _write_embedded_sv(out_dir, "mac.sv", MAC_SV)
+    _write_embedded_sv(out_dir, "fc_in.sv", FC_IN_SV)
+    _write_embedded_sv(out_dir, "fc_out.sv", FC_OUT_SV)
+    _write_embedded_sv(out_dir, "relu_layer.sv", RELU_LAYER_SV)
+    _write_embedded_sv(out_dir, "sync_fifo.sv", SYNC_FIFO_SV)
     LOGGER.info("  Wrote shared building blocks: quant_pkg, mac, fc_in, fc_out, relu_layer, sync_fifo")
 
     # ----- Step 2: Multiclass-specific SV shells -----
@@ -1997,7 +4216,7 @@ def emit_multiclass_format(
             description=f"Bias ROM for conv layer {layer.name} (BIAS_WIDTH=32 per filter)",
         )
 
-    # ----- Step 4: FC chain .mem files (reuse binary script) -----
+    # ----- Step 4: FC chain .mem files -----
     flatten_layer = LayerInfo(name="flatten_1", layer_type="flatten", out_shape=(1, flatten_size))
     fc_chain: List[LayerInfo] = [flatten_layer]
     for i, lyr in enumerate(fc_linear_only):
@@ -2006,10 +4225,10 @@ def emit_multiclass_format(
             fc_chain.append(LayerInfo(name=f"fc_relu_{i+1}", layer_type="relu"))
     generate_proj_mem_files(fc_chain, mem_dir, scale, weight_width, debug_mem=debug_mem)
 
-    # ----- Step 5: FC ROM .sv + fc_in_layer / fc_out_layer (reuse binary script) -----
+    # ----- Step 5: FC ROM .sv + fc_in_layer / fc_out_layer -----
     n_fc = len(fc_linear_only)
     num_fc_blocks = (n_fc + 1) // 2
-    fc_params = _compute_binaryclass_nn_params(fc_linear_only, weight_width, scale)
+    fc_params = _compute_fc_chain_params(fc_linear_only, weight_width, scale)
     input_sizes = [fc_params[f"FC_{b}_INPUT_SIZE"] for b in range(1, num_fc_blocks + 1)]
     rom_depths = [fc_params[f"FC_{b}_ROM_DEPTH"] for b in range(1, num_fc_blocks + 1)]
     for b in range(num_fc_blocks):
@@ -2022,12 +4241,12 @@ def emit_multiclass_format(
         rom_d = (out_layer.out_features or 1) if out_layer else 1
         proj_out_f = (out_layer.out_features or 1) if out_layer else 1
         prefix = _proj_prefix(b)
-        _generate_binaryclass_nn_rom(out_dir, f"{prefix}_in_weights_rom", in_f, in_out, weight_width)
-        _generate_binaryclass_nn_rom(out_dir, f"{prefix}_in_bias_rom", 1, in_out, weight_width)
-        _generate_binaryclass_nn_rom(out_dir, f"{prefix}_out_weights_rom", rom_d, proj_out_f, weight_width)
-        _generate_binaryclass_nn_rom(out_dir, f"{prefix}_out_bias_rom", rom_d, 1, weight_width)
-    _generate_fc_in_layer_binaryclass(out_dir, input_sizes, weight_width)
-    _generate_fc_out_layer_binaryclass(out_dir, rom_depths, weight_width)
+        _generate_fc_rom(out_dir, f"{prefix}_in_weights_rom", in_f, in_out, weight_width)
+        _generate_fc_rom(out_dir, f"{prefix}_in_bias_rom", 1, in_out, weight_width)
+        _generate_fc_rom(out_dir, f"{prefix}_out_weights_rom", rom_d, proj_out_f, weight_width)
+        _generate_fc_rom(out_dir, f"{prefix}_out_bias_rom", rom_d, 1, weight_width)
+    _generate_fc_in_layer_module(out_dir, input_sizes, weight_width)
+    _generate_fc_out_layer_module(out_dir, rom_depths, weight_width)
 
     # ----- Step 6: Top module + wrapper -----
     generate_multiclass_NN_top(
